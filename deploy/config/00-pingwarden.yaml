@@ -1,0 +1,20 @@
+# Settings. Monitors may live in further files of this directory (sorted by
+# name and merged), e.g. 10-network.yaml, 20-web.yaml.
+server:
+  listen: 0.0.0.0:8080
+  api_tokens:
+    - name: admin
+      token: ${PINGWARDEN_ADMIN_TOKEN}
+      scope: admin
+
+database:
+  url: ${DATABASE_URL}
+
+defaults:
+  interval: 60s
+  notify: [ntfy]
+
+notifiers:
+  ntfy:
+    type: ntfy
+    url: https://ntfy.sh/${NTFY_TOPIC:-change-me}

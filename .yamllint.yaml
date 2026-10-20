@@ -1,0 +1,15 @@
+# yamllint configuration: https://yamllint.readthedocs.io/
+extends: default
+
+ignore-from-file: [.gitignore]
+
+rules:
+  line-length:
+    max: 140
+  document-start: disable
+  comments:
+    min-spaces-from-content: 1
+  braces:
+    max-spaces-inside: 1
+  brackets:
+    max-spaces-inside: 1

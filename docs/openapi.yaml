@@ -1,0 +1,440 @@
+openapi: 3.1.0
+info:
+  title: Pingwarden API
+  version: 0.1.0
+  description: |
+    Read-mostly API of Pingwarden, for UIs and automation. Timestamps are
+    milliseconds since the Unix epoch. Endpoints under `/api/v1` need a bearer
+    token (`server.api_tokens`): GET needs `read`, other methods need `admin`.
+    The push endpoint needs none. Live endpoints answer 503 on a standby
+    instance. Deployments may serve the endpoint groups (health, metrics,
+    api, push) on different listeners (`server.listeners`).
+  license:
+    name: MIT
+servers:
+  - url: http://localhost:8080
+security:
+  - bearer: []
+
+paths:
+  /healthz:
+    get:
+      summary: Liveness
+      security: []
+      responses:
+        "200": { description: "Process alive", content: { text/plain: { schema: { type: string, const: ok } } } }
+  /readyz:
+    get:
+      summary: Readiness
+      security: []
+      parameters:
+        - { name: role, in: query, schema: { type: string, enum: [leader] }, description: "Also require leadership" }
+      responses:
+        "200": { $ref: "#/components/responses/Ready" }
+        "503": { $ref: "#/components/responses/Ready" }
+  /metrics:
+    get:
+      summary: Prometheus metrics (OpenMetrics text)
+      description: Protected by `server.metrics_token` when set.
+      security: [{}, { bearer: [] }]
+      responses:
+        "200": { description: "Metrics", content: { application/openmetrics-text: { schema: { type: string } } } }
+
+  /api/v1/status:
+    get:
+      summary: Instance status
+      responses:
+        "200":
+          description: Status
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [version, leader, database, monitors]
+                properties:
+                  version: { type: string }
+                  leader: { type: boolean }
+                  database: { type: string, enum: [postgres, mysql] }
+                  monitors:
+                    type: object
+                    description: Number of monitors per status
+                    additionalProperties: { type: integer }
+  /api/v1/monitors:
+    get:
+      summary: List monitors with their live state
+      parameters:
+        - { name: tag, in: query, schema: { type: string }, description: "Own or inherited tag" }
+        - { name: group, in: query, schema: { type: string }, description: "Group id, including nested groups" }
+        - { name: status, in: query, schema: { $ref: "#/components/schemas/Status" } }
+        - { name: type, in: query, schema: { $ref: "#/components/schemas/MonitorType" } }
+      responses:
+        "200":
+          description: Monitors
+          content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Monitor" } } } }
+        "503": { $ref: "#/components/responses/Standby" }
+  /api/v1/monitors/{id}:
+    parameters: [{ $ref: "#/components/parameters/MonitorId" }]
+    get:
+      summary: One monitor
+      responses:
+        "200": { description: "Monitor", content: { application/json: { schema: { $ref: "#/components/schemas/Monitor" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Standby" }
+  /api/v1/monitors/{id}/heartbeats:
+    parameters: [{ $ref: "#/components/parameters/MonitorId" }]
+    get:
+      summary: Raw check results, newest first
+      description: Default range is the last 24 hours. Also works for monitors removed from the configuration.
+      parameters:
+        - { $ref: "#/components/parameters/From" }
+        - { $ref: "#/components/parameters/To" }
+        - { $ref: "#/components/parameters/Limit" }
+      responses:
+        "200":
+          description: Heartbeats
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [monitor, from, to, heartbeats]
+                properties:
+                  monitor: { type: string }
+                  from: { type: integer, format: int64 }
+                  to: { type: integer, format: int64 }
+                  heartbeats: { type: array, items: { $ref: "#/components/schemas/Heartbeat" } }
+  /api/v1/monitors/{id}/events:
+    parameters: [{ $ref: "#/components/parameters/MonitorId" }]
+    get:
+      summary: Status transitions of a monitor (default last 30 days)
+      parameters:
+        - { $ref: "#/components/parameters/From" }
+        - { $ref: "#/components/parameters/To" }
+        - { $ref: "#/components/parameters/Limit" }
+      responses:
+        "200": { $ref: "#/components/responses/Events" }
+  /api/v1/monitors/{id}/uptime:
+    parameters: [{ $ref: "#/components/parameters/MonitorId" }]
+    get:
+      summary: Uptime and average latency over 24h, 7d, 30d and 365d
+      responses:
+        "200":
+          description: Uptime windows
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [monitor, windows]
+                properties:
+                  monitor: { type: string }
+                  windows: { type: array, items: { $ref: "#/components/schemas/UptimeWindow" } }
+  /api/v1/monitors/{id}/rollups:
+    parameters: [{ $ref: "#/components/parameters/MonitorId" }]
+    get:
+      summary: Hourly or daily aggregates, for charts
+      parameters:
+        - { name: resolution, in: query, schema: { type: string, enum: [hour, day], default: hour } }
+        - { $ref: "#/components/parameters/From" }
+        - { $ref: "#/components/parameters/To" }
+      responses:
+        "200":
+          description: Rollups (default range 7 days for hours, 365 days for days)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [monitor, resolution, rollups]
+                properties:
+                  monitor: { type: string }
+                  resolution: { type: integer, enum: [3600, 86400] }
+                  rollups: { type: array, items: { $ref: "#/components/schemas/Rollup" } }
+        "400": { $ref: "#/components/responses/Error" }
+  /api/v1/monitors/{id}/check:
+    parameters: [{ $ref: "#/components/parameters/MonitorId" }]
+    post:
+      summary: Run the check now (admin)
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { description: "Monitor disabled in the configuration", $ref: "#/components/responses/Error" }
+  /api/v1/monitors/{id}/pause:
+    parameters: [{ $ref: "#/components/parameters/MonitorId" }]
+    post:
+      summary: Pause the monitor (admin); persisted across restarts
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "404": { $ref: "#/components/responses/Error" }
+  /api/v1/monitors/{id}/resume:
+    parameters: [{ $ref: "#/components/parameters/MonitorId" }]
+    post:
+      summary: Resume a paused monitor (admin)
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "404": { $ref: "#/components/responses/Error" }
+  /api/v1/groups:
+    get:
+      summary: Groups with their aggregated status
+      responses:
+        "200":
+          description: Groups
+          content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Group" } } } }
+  /api/v1/tags:
+    get:
+      summary: Tags with the monitors (effective tags) and groups carrying them
+      responses:
+        "200":
+          description: Tags
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  required: [tag, monitors, groups]
+                  properties:
+                    tag: { type: string }
+                    monitors: { type: array, items: { type: string } }
+                    groups: { type: array, items: { type: string } }
+  /api/v1/maintenance:
+    get:
+      summary: Maintenance windows and whether they are active
+      responses:
+        "200":
+          description: Windows
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  required: [id, active, monitors]
+                  properties:
+                    id: { type: string }
+                    description: { type: [string, "null"] }
+                    active: { type: boolean }
+                    active_until: { type: [integer, "null"], format: int64 }
+                    monitors: { type: array, items: { type: string } }
+  /api/v1/events:
+    get:
+      summary: Status transitions of all monitors (default last 24 hours)
+      parameters:
+        - { $ref: "#/components/parameters/From" }
+        - { $ref: "#/components/parameters/To" }
+        - { $ref: "#/components/parameters/Limit" }
+      responses:
+        "200": { $ref: "#/components/responses/Events" }
+  /api/v1/notifiers:
+    get:
+      summary: Configured notifiers (no secrets)
+      responses:
+        "200":
+          description: Notifiers
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  required: [id, type]
+                  properties:
+                    id: { type: string }
+                    type: { type: string, enum: [webhook, ntfy, gotify, matrix, discord, slack, telegram, pushover, email] }
+                    events: { type: [array, "null"], items: { $ref: "#/components/schemas/EventKind" } }
+  /api/v1/notifiers/{id}/test:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+    post:
+      summary: Send a test notification now (admin)
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "404": { $ref: "#/components/responses/Error" }
+        "502": { description: "Delivery failed", $ref: "#/components/responses/Error" }
+  /api/v1/notifications:
+    get:
+      summary: Notification delivery log (default last 7 days)
+      parameters:
+        - { $ref: "#/components/parameters/From" }
+        - { $ref: "#/components/parameters/To" }
+        - { $ref: "#/components/parameters/Limit" }
+      responses:
+        "200":
+          description: Deliveries
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [from, to, notifications]
+                properties:
+                  from: { type: integer, format: int64 }
+                  to: { type: integer, format: int64 }
+                  notifications:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, ts, notifier, event, success]
+                      properties:
+                        id: { type: integer, format: int64 }
+                        ts: { type: integer, format: int64 }
+                        monitor_id: { type: [string, "null"] }
+                        notifier: { type: string }
+                        event: { $ref: "#/components/schemas/EventKind" }
+                        success: { type: boolean }
+                        error: { type: [string, "null"] }
+  /api/v1/reload:
+    post:
+      summary: Reload the configuration (admin)
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "422": { description: "Invalid configuration (the current one is kept)", $ref: "#/components/responses/Error" }
+  /api/v1/push/{token}:
+    parameters:
+      - { name: token, in: path, required: true, schema: { type: string } }
+      - { name: status, in: query, schema: { type: string, enum: [up, down, degraded], default: up } }
+      - { name: msg, in: query, schema: { type: string, maxLength: 512 } }
+      - { name: ping, in: query, schema: { type: number }, description: "Latency in milliseconds" }
+    get:
+      summary: Report a result for a push monitor
+      security: []
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "404": { $ref: "#/components/responses/Error" }
+    post:
+      summary: Report a result for a push monitor
+      security: []
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "404": { $ref: "#/components/responses/Error" }
+
+components:
+  securitySchemes:
+    bearer: { type: http, scheme: bearer }
+  parameters:
+    MonitorId: { name: id, in: path, required: true, schema: { type: string } }
+    From: { name: from, in: query, schema: { type: integer, format: int64 }, description: "Inclusive, ms since epoch" }
+    To: { name: to, in: query, schema: { type: integer, format: int64 }, description: "Exclusive, ms since epoch (default now)" }
+    Limit: { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 10000, default: 500 } }
+  responses:
+    Ok:
+      description: Done
+      content: { application/json: { schema: { type: object, required: [ok], properties: { ok: { type: boolean } } } } }
+    Error:
+      description: Error
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Standby:
+      description: This instance is on standby
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Ready:
+      description: Readiness
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [ready, database, leader]
+            properties:
+              ready: { type: boolean }
+              database: { type: boolean }
+              leader: { type: boolean }
+    Events:
+      description: Events, newest first
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [from, to, events]
+            properties:
+              monitor: { type: string }
+              from: { type: integer, format: int64 }
+              to: { type: integer, format: int64 }
+              events: { type: array, items: { $ref: "#/components/schemas/Event" } }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties: { error: { type: string } }
+    Status:
+      type: string
+      enum: [up, down, degraded, pending, maintenance, paused, unknown]
+    MonitorType:
+      type: string
+      enum: [icmp, tcp, udp, http, tls, dns, ntp, postgres, mysql, push]
+    EventKind:
+      type: string
+      enum: [down, up, degraded, reminder, flapping, test]
+    Monitor:
+      type: object
+      required: [id, name, type, target, tags, enabled, interval_seconds, depends_on, notify]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        description: { type: [string, "null"] }
+        type: { $ref: "#/components/schemas/MonitorType" }
+        target: { type: string, description: "Host, URL or query, without credentials" }
+        group: { type: [string, "null"] }
+        tags: { type: array, items: { type: string }, description: "Own and inherited tags" }
+        enabled: { type: boolean }
+        interval_seconds: { type: number }
+        depends_on: { type: array, items: { type: string } }
+        notify: { type: array, items: { type: string } }
+        status: { $ref: "#/components/schemas/Status" }
+        since: { type: integer, format: int64, description: "Since when the monitor is in `status`" }
+        outcome: { description: "Raw outcome of the last check", oneOf: [{ $ref: "#/components/schemas/Status" }, { type: "null" }] }
+        last_check: { type: [integer, "null"], format: int64 }
+        latency_ms: { type: [number, "null"] }
+        message: { type: [string, "null"] }
+        paused: { type: boolean }
+        flapping: { type: boolean }
+        maintenance: { type: [string, "null"], description: "Active maintenance window id" }
+        cert_expiry: { type: [integer, "null"], format: int64, description: "Seconds since epoch (TLS monitors)" }
+        consecutive_failures: { type: integer }
+    Heartbeat:
+      type: object
+      required: [ts, status]
+      properties:
+        ts: { type: integer, format: int64 }
+        status: { $ref: "#/components/schemas/Status" }
+        latency_ms: { type: [number, "null"] }
+        message: { type: [string, "null"] }
+    Event:
+      type: object
+      required: [id, monitor_id, ts, to]
+      properties:
+        id: { type: integer, format: int64 }
+        monitor_id: { type: string }
+        ts: { type: integer, format: int64 }
+        from: { oneOf: [{ $ref: "#/components/schemas/Status" }, { type: "null" }] }
+        to: { $ref: "#/components/schemas/Status" }
+        message: { type: [string, "null"] }
+        suppressed_reason: { type: [string, "null"], description: "Why no notification was sent" }
+    UptimeWindow:
+      type: object
+      required: [window, checks, down, maintenance]
+      properties:
+        window: { type: string, enum: [24h, 7d, 30d, 365d] }
+        uptime: { type: [number, "null"], description: "Percentage of up or degraded results, maintenance excluded" }
+        avg_latency_ms: { type: [number, "null"] }
+        checks: { type: integer }
+        down: { type: integer }
+        maintenance: { type: integer }
+    Rollup:
+      type: object
+      required: [bucket, up, degraded, down, maintenance, latency_sum_us, latency_count]
+      properties:
+        bucket: { type: integer, format: int64, description: "Start of the bucket, ms since epoch" }
+        up: { type: integer }
+        degraded: { type: integer }
+        down: { type: integer }
+        maintenance: { type: integer }
+        latency_sum_us: { type: integer, format: int64 }
+        latency_count: { type: integer }
+        latency_min_us: { type: [integer, "null"], format: int64 }
+        latency_max_us: { type: [integer, "null"], format: int64 }
+    Group:
+      type: object
+      required: [id, name, tags, status, monitors, groups]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        description: { type: [string, "null"] }
+        parent: { type: [string, "null"] }
+        tags: { type: array, items: { type: string } }
+        status: { $ref: "#/components/schemas/Status" }
+        monitors: { type: array, items: { type: string }, description: "Direct members" }
+        groups: { type: array, items: { type: string }, description: "Direct subgroups" }

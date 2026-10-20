@@ -1,0 +1,18 @@
+groups:
+  - id: internet
+    tags: [infra]
+
+monitors:
+  - id: cloudflare-dns
+    type: icmp
+    host: 1.1.1.1
+    group: internet
+  - id: example-web
+    type: http
+    url: https://example.com/
+    keyword: Example Domain
+    depends_on: [cloudflare-dns]
+  - id: example-cert
+    type: tls
+    host: example.com
+    interval: 6h

@@ -1,0 +1,7 @@
+.*
+!.github
+!.dockerignore
+!.envrc
+!.gitignore
+/target
+!.yamllint.yaml

@@ -1,0 +1,48 @@
+# Pingwarden with PostgreSQL. Start with:
+#   POSTGRES_PASSWORD=… PINGWARDEN_ADMIN_TOKEN=… docker compose -f deploy/docker-compose.yaml up -d
+# Configuration lives in deploy/config/*.yaml (reload with `docker kill -s HUP pingwarden`).
+
+services:
+  pingwarden:
+    image: ghcr.io/sebastka/pingwarden:edge
+    container_name: pingwarden
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://pingwarden:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres/pingwarden
+      PINGWARDEN_ADMIN_TOKEN: ${PINGWARDEN_ADMIN_TOKEN:?set PINGWARDEN_ADMIN_TOKEN}
+      PINGWARDEN_LOG_FORMAT: json
+    volumes:
+      - ./config:/etc/pingwarden:ro
+    ports:
+      - "8080:8080"
+    # Fully unprivileged: no capability, read-only root, no privilege gain.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    # Lets the unprivileged user (GID 65532) open ICMP datagram sockets, so
+    # ICMP monitors need no CAP_NET_RAW. See docs/deployment.md.
+    sysctls:
+      net.ipv4.ping_group_range: "65532 65532"
+    mem_limit: 64m
+    pids_limit: 64
+
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pingwarden
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: pingwarden
+    volumes:
+      - postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "pingwarden"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres:

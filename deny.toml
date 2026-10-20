@@ -1,0 +1,35 @@
+# cargo-deny: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# The project deliberately uses ring rather than aws-lc-rs (no cmake/perl in
+# the hardened build image, smaller binary).
+deny = [{ crate = "aws-lc-rs", reason = "ring is used as the rustls provider" }, { crate = "openssl-sys", reason = "rustls only" }]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -1,0 +1,197 @@
+# Pingwarden example configuration. Every option is documented in
+# docs/configuration.md. `${VAR}`, `${VAR:-default}` and `${file:/path}` are
+# substituted in string values.
+
+server:
+  # `listen: 0.0.0.0:8080` serves everything on one port; listeners split
+  # the endpoint groups (health, metrics, api, push) across addresses.
+  listeners:
+    - listen: 0.0.0.0:8080
+      serve: [api, push]
+    - listen: 0.0.0.0:9090
+      serve: [health, metrics]
+  api_tokens:
+    - name: ui
+      token: ${PINGWARDEN_UI_TOKEN:-change-me-read-only-token}
+      scope: read
+    - name: admin
+      token: ${PINGWARDEN_ADMIN_TOKEN:-change-me-admin-token-0000}
+      scope: admin
+
+database:
+  # postgres://… or mariadb://… (mysql:// works too)
+  url: ${DATABASE_URL:-postgres://pingwarden:pingwarden@postgres/pingwarden}
+
+retention:
+  heartbeats: 14d
+  hourly: 400d
+  daily: 0 # forever
+
+defaults:
+  interval: 60s
+  timeout: 10s
+  failure_threshold: 3
+  recovery_threshold: 1
+  notify: [ntfy]
+  renotify_every: 6h
+  flapping: { window: 1h, max_transitions: 6 }
+
+notifiers:
+  ntfy:
+    type: ntfy
+    url: https://ntfy.sh/${NTFY_TOPIC:-pingwarden-example}
+    priority: 5
+  ops-mail:
+    type: email
+    host: smtp.example.com
+    port: 587
+    security: starttls
+    username: pingwarden@example.com
+    # With Docker or Kubernetes secrets: ${file:/run/secrets/smtp-password}
+    password: ${SMTP_PASSWORD:-change-me}
+    from: Pingwarden <pingwarden@example.com>
+    to: [ops@example.com]
+    events: [down, up, reminder]
+  hook:
+    type: webhook
+    url: https://hooks.example.com/pingwarden
+    headers:
+      Authorization: Bearer ${HOOK_TOKEN:-none}
+
+groups:
+  - id: network
+    name: Network
+    tags: [infra]
+    defaults:
+      interval: 30s
+  - id: wan
+    name: Internet uplinks
+    parent: network
+    # Down only when every uplink is down.
+    status_policy: all_down
+  - id: web
+    name: Public websites
+    tags: [public]
+    defaults:
+      notify: [ntfy, ops-mail]
+
+monitors:
+  - id: router
+    name: Core router
+    type: icmp
+    host: 192.0.2.1
+    group: network
+    tags: [critical]
+    failure_threshold: 2
+    degraded_latency: 50ms
+
+  - id: uplink-fiber
+    type: icmp
+    host: 198.51.100.1
+    group: wan
+    depends_on: [router]
+
+  - id: uplink-lte
+    type: icmp
+    host: 203.0.113.1
+    group: wan
+    depends_on: [router]
+    degraded_loss_percent: 20
+
+  - id: website
+    name: example.com
+    type: http
+    url: https://example.com/
+    group: web
+    keyword: Example Domain
+    degraded_latency: 2s
+    depends_on: [router]
+
+  - id: api-health
+    type: http
+    url: https://api.example.com/health
+    group: web
+    method: GET
+    headers:
+      Accept: application/json
+    accepted_status: ["200"]
+    json_path: status
+    json_value: ok
+
+  - id: website-cert
+    type: tls
+    host: example.com
+    group: web
+    interval: 6h
+    expiry_warning: 21d
+    expiry_down: 3d
+
+  - id: mail-starttls
+    type: tls
+    host: mail.example.com
+    port: 587
+    starttls: smtp
+    interval: 12h
+
+  - id: ssh
+    type: tcp
+    host: bastion.example.com
+    port: 22
+    expect: "SSH-"
+    tags: [infra]
+
+  - id: dns-public
+    type: dns
+    domain: example.com
+    record_type: A
+    server: 1.1.1.1
+    expect: [93.184.215.14]
+
+  - id: wireguard
+    type: udp
+    host: vpn.example.com
+    port: 51820
+    # WireGuard never answers unauthenticated packets: only an ICMP
+    # port-unreachable can mark it down.
+    expect_response: false
+    tags: [infra]
+
+  - id: dns-resolver-udp
+    type: udp
+    host: 192.0.2.53
+    port: 53
+    # A DNS query for example.com/A; any reply proves the resolver is alive.
+    payload_hex: "12 34 01 00 00 01 00 00 00 00 00 00 07 65 78 61 6d 70 6c 65 03 63 6f 6d 00 00 01 00 01"
+    expect_hex: "12 34"
+
+  - id: ntp
+    type: ntp
+    host: pool.ntp.org
+    max_offset: 500ms
+    interval: 5m
+
+  - id: postgres
+    type: postgres
+    url: postgres://monitor:${PG_MONITOR_PASSWORD:-secret}@db.example.com/postgres
+    tags: [database]
+
+  - id: nightly-backup
+    type: push
+    # Call GET https://pingwarden.example.com/api/v1/push/<token>?status=up&msg=OK
+    token: ${BACKUP_PUSH_TOKEN:-0123456789abcdef0123}
+    interval: 26h
+    failure_threshold: 1
+
+maintenance:
+  - id: weekly-isp-maintenance
+    description: ISP maintenance window
+    groups: [wan]
+    recurring:
+      days: [tue]
+      start: "01:00"
+      duration: 2h
+      timezone: Europe/Oslo
+  - id: datacenter-move
+    tags: [database]
+    start: 2026-11-14T08:00:00+01:00
+    end: 2026-11-14T18:00:00+01:00

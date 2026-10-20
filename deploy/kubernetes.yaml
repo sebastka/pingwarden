@@ -1,0 +1,65 @@
+# Minimal Kubernetes deployment. Provide the `pingwarden` Secret (DATABASE_URL,
+# PINGWARDEN_ADMIN_TOKEN) and the `pingwarden-config` ConfigMap (one or more
+# *.yaml files) yourself, e.g. with kustomize's configMapGenerator.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pingwarden
+  labels: { app.kubernetes.io/name: pingwarden }
+spec:
+  replicas: 1
+  # The leader lock already prevents two instances from running checks, but
+  # a standby is never "leader-ready": Recreate avoids stuck rollouts.
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app.kubernetes.io/name: pingwarden }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: pingwarden }
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+        # A "safe" sysctl: ICMP datagram sockets for the pod's group, no
+        # CAP_NET_RAW needed.
+        sysctls:
+          - name: net.ipv4.ping_group_range
+            value: "65532 65532"
+      containers:
+        - name: pingwarden
+          image: ghcr.io/sebastka/pingwarden:edge
+          args: [run]
+          env:
+            - { name: PINGWARDEN_LOG_FORMAT, value: json }
+          envFrom:
+            - secretRef: { name: pingwarden }
+          ports:
+            - { name: http, containerPort: 8080 }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 64Mi }
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+          volumeMounts:
+            - { name: config, mountPath: /etc/pingwarden, readOnly: true }
+      volumes:
+        - name: config
+          configMap: { name: pingwarden-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pingwarden
+spec:
+  selector: { app.kubernetes.io/name: pingwarden }
+  ports:
+    - { name: http, port: 8080, targetPort: http }

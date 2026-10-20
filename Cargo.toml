@@ -1,0 +1,64 @@
+[package]
+name = "pingwarden"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+description = "Headless, configuration-as-code uptime monitor"
+license = "MIT"
+repository = "https://github.com/sebastka/pingwarden"
+readme = "README.md"
+publish = false
+
+[lib]
+# No doctests; the DHI build image ships without rustdoc.
+doctest = false
+
+[features]
+default = []
+# Use mimalloc instead of the system (musl) allocator. See DECISIONS.md.
+mimalloc = ["dep:mimalloc"]
+
+[dependencies]
+anyhow = "1.0.104"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "matched-path"] }
+clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
+hickory-resolver = { version = "0.26.3", default-features = false, features = ["system-config", "tokio"] }
+jiff = { version = "0.2.38", default-features = false, features = ["std", "tz-system", "tzdb-bundle-always", "tzdb-zoneinfo"] }
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "ring", "rustls-native-certs", "hostname"] }
+mimalloc = { version = "0.1.52", optional = true, default-features = false }
+prometheus-client = "0.25.1"
+rand = { version = "0.10.3", default-features = false, features = ["std", "thread_rng"] }
+regex = { version = "1.13.1", default-features = false, features = ["std", "perf", "unicode"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "form", "http2", "charset"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8.5"
+serde = { version = "1.0.229", features = ["derive"] }
+serde-saphyr = "2.0.0"
+serde_json = "1.0.154"
+serde_path_to_error = "0.1"
+sha2 = "0.11.1"
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "mysql", "any", "migrate", "macros"] }
+surge-ping = "0.9.1"
+thiserror = "2.0.21"
+tokio = { version = "1.54.0", features = ["rt", "rt-multi-thread", "macros", "net", "time", "signal", "sync", "io-util", "fs"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt", "ansi", "env-filter", "json"] }
+url = "2.5.8"
+x509-parser = { version = "0.18.1", default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1.54.0", features = ["test-util"] }
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
