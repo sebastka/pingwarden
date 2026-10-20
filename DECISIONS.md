@@ -303,11 +303,11 @@ found an `id: y` turned into `true`.
   build with a smoke test.
 - **release.yaml:** multi-arch images (amd64 and arm64 on native runners,
   merged by digest) pushed to `ghcr.io/sebastka/pingwarden` with SBOM and
-  provenance. Pushes to `main` publish `edge`; `v*` tags publish semver tags.
+  provenance. Pushes to `master` publish `edge`; `v*` tags publish semver tags.
 - **Pinning:** Actions are pinned by commit SHA, with the version in a comment.
 - **Dependabot:** weekly, grouped, for Cargo, Actions, the Dockerfile and the
   compose example.
-- **Secrets:** pulling DHI images needs `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`.
+- **Credentials:** pulling DHI images uses the `DOCKERHUB_USERNAME` variable and the `DOCKERHUB_TOKEN` secret.
   Pull requests from forks skip the Docker job.
 
 ### D25. License: MIT
