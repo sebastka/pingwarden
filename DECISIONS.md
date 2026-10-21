@@ -345,8 +345,12 @@ Renovate (`renovate.json5`, hosted Mend app) covers all of them:
   security fixes.
 - **Cargo:** requirements in `Cargo.toml` are raised (`rangeStrategy: bump`),
   and lock file maintenance refreshes transitive dependencies.
-- **Registry access:** `dhi.io` is reached with the `DOCKERHUB_TOKEN` secret
-  set in the Mend developer portal.
+- **Registry access:** credentials live in Mend, not in the repository.
+  User-scope host rules in the Mend developer portal cover `dhi.io`,
+  `docker.io` and `hub.docker.com` (type `docker`, Docker Hub username, the
+  `DOCKERHUB_TOKEN` secret as password). Mend did not pass a user-scope
+  *variable* to runs, so `{{ variables.… }}` in `renovate.json5` failed
+  validation.
 - **Security alerts:** Dependabot alerts stay enabled as Renovate's
   vulnerability source. Dependabot security-update PRs are disabled to avoid
   duplicates.
