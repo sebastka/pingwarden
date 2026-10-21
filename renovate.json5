@@ -34,17 +34,6 @@
     minimumReleaseAge: null,
   },
 
-  hostRules: [
-    {
-      // Docker Hardened Images (Dockerfile base images). Set the
-      // DOCKERHUB_USERNAME variable and DOCKERHUB_TOKEN secret in the Mend
-      // developer portal.
-      matchHost: "dhi.io",
-      hostType: "docker",
-      username: "{{ variables.DOCKERHUB_USERNAME }}",
-      password: "{{ secrets.DOCKERHUB_TOKEN }}",
-    },
-  ],
 
   packageRules: [
     {
