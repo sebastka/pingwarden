@@ -51,6 +51,13 @@
       labels: ["major"],
     },
     {
+      description: "CI test databases follow the latest releases, majors included (CI must still pass). Not the compose example: a real PostgreSQL major needs a data migration.",
+      matchManagers: ["github-actions"],
+      matchDepTypes: ["service"],
+      matchUpdateTypes: ["major"],
+      automerge: true,
+    },
+    {
       description: "Raise Cargo.toml requirements, not only Cargo.lock.",
       matchManagers: ["cargo"],
       rangeStrategy: "bump",

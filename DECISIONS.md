@@ -297,8 +297,8 @@ found an `id: y` turned into `true`.
 `scratch`-like base, given a CA bundle.
 
 ### D24. CI
-- **ci.yaml:** rustfmt, clippy `-D warnings`, tests against PostgreSQL 18 and
-  MariaDB 11.8 service containers, the example configuration validated,
+- **ci.yaml:** rustfmt, clippy `-D warnings`, tests against the latest PostgreSQL and
+  MariaDB service containers, the example configuration validated,
   yamllint, cargo-deny (advisories, bans, licenses, sources), and a Docker
   build with a smoke test.
 - **release.yaml:** multi-arch images (amd64 and arm64 on native runners,
@@ -340,7 +340,11 @@ Renovate (`renovate.json5`, hosted Mend app) covers all of them:
   merge themselves through GitHub auto-merge once the required checks pass.
   GitHub signs the squash commits, so they satisfy the signed-commit rule.
 - **Majors are reviewed by hand,** and so are Cargo `0.x` minor bumps, which
-  are semver-incompatible in Cargo.
+  are semver-incompatible in Cargo. Exception: the PostgreSQL and MariaDB
+  service containers of CI track the latest releases, majors included
+  (pinned to `major.minor`, e.g. `mariadb:13.0`, so every bump is a tested
+  PR). The PostgreSQL image of the compose example stays manual, because a
+  major upgrade there needs a data migration.
 - **Release age:** releases wait 3 days before being proposed, except
   security fixes.
 - **Cargo:** requirements in `Cargo.toml` are raised (`rangeStrategy: bump`),
