@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.28.0@sha256:bb22d9815c728170f72750f4e5b0d672e06176142e1d602c7e66c050100b7e5b
 
 # Docker Hardened Images, pinned by multi-arch index digest (amd64 + arm64).
-# Dependabot keeps the digests up to date.
+# Renovate keeps the digests (and the syntax directive) up to date.
 FROM dhi.io/rust:1-alpine3.24-dev@sha256:6bbcb7ee79ca392423153a27f9d738ade51052b2282420dbae22babbd27774ab AS build
 
 WORKDIR /src

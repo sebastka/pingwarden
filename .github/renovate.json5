@@ -1,0 +1,108 @@
+// Renovate configuration: https://docs.renovatebot.com/configuration-options/
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  extends: [
+    "config:recommended",
+    // Keep GitHub Actions pinned by commit SHA, with the version as comment.
+    "helpers:pinGitHubActionDigests",
+  ],
+
+  timezone: "Europe/Paris",
+  // Nightly, for updates and for merging them.
+  schedule: ["* 0-5 * * *"],
+  automergeSchedule: ["* 0-5 * * *"],
+  prHourlyLimit: 0,
+  prConcurrentLimit: 10,
+
+  // Everything but majors merges itself once the required checks pass
+  // (GitHub auto-merge, squash, so commits stay signed and linear).
+  automerge: true,
+  platformAutomerge: true,
+  automergeStrategy: "squash",
+  // Let fresh releases settle before they are proposed (yanks, takedowns).
+  minimumReleaseAge: "3 days",
+
+  semanticCommits: "enabled",
+  lockFileMaintenance: {
+    enabled: true,
+    schedule: ["* 0-5 * * *"],
+  },
+  vulnerabilityAlerts: {
+    labels: ["security"],
+    // Security fixes are proposed at once, not at night.
+    schedule: ["at any time"],
+    minimumReleaseAge: null,
+  },
+
+  hostRules: [
+    {
+      // Docker Hardened Images (Dockerfile base images). Set the
+      // DOCKERHUB_USERNAME variable and DOCKERHUB_TOKEN secret in the Mend
+      // developer portal.
+      matchHost: "dhi.io",
+      hostType: "docker",
+      username: "{{ variables.DOCKERHUB_USERNAME }}",
+      password: "{{ secrets.DOCKERHUB_TOKEN }}",
+    },
+  ],
+
+  packageRules: [
+    {
+      description: "Majors are reviewed by hand.",
+      matchUpdateTypes: ["major"],
+      automerge: false,
+      labels: ["major"],
+    },
+    {
+      description: "In Cargo, a 0.x minor bump (0.8 -> 0.9) is semver-incompatible: treat it as a major.",
+      matchManagers: ["cargo"],
+      matchCurrentVersion: "<1.0.0",
+      matchUpdateTypes: ["minor"],
+      automerge: false,
+      labels: ["major"],
+    },
+    {
+      description: "Raise Cargo.toml requirements, not only Cargo.lock.",
+      matchManagers: ["cargo"],
+      rangeStrategy: "bump",
+    },
+    {
+      groupName: "Rust crates (non-major)",
+      matchManagers: ["cargo"],
+      matchUpdateTypes: ["minor", "patch"],
+      matchCurrentVersion: ">=1.0.0",
+    },
+    {
+      groupName: "Rust crates (0.x patch)",
+      matchManagers: ["cargo"],
+      matchUpdateTypes: ["patch"],
+      matchCurrentVersion: "<1.0.0",
+    },
+    {
+      groupName: "GitHub Actions",
+      matchManagers: ["github-actions"],
+      matchDepTypes: ["action"],
+      matchUpdateTypes: ["minor", "patch", "digest", "pin", "pinDigest"],
+    },
+    {
+      groupName: "Container images",
+      matchDatasources: ["docker"],
+      matchUpdateTypes: ["minor", "patch", "digest", "pin", "pinDigest"],
+    },
+    {
+      description: "The project's own image in the deployment examples tracks `edge` on purpose.",
+      matchPackageNames: ["ghcr.io/sebastka/pingwarden"],
+      enabled: false,
+    },
+  ],
+
+  customManagers: [
+    {
+      description: "yamllint version run by CI through pipx.",
+      customType: "regex",
+      managerFilePatterns: ["/^\\.github/workflows/.+\\.yaml$/"],
+      matchStrings: ["pipx run (?<depName>yamllint)==(?<currentValue>[\\d.]+)"],
+      datasourceTemplate: "pypi",
+    },
+  ],
+}
