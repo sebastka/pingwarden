@@ -335,7 +335,7 @@ workflows (checked in dependabot-core). It would therefore miss:
 - the PostgreSQL and MariaDB service containers in CI;
 - the yamllint version run through pipx.
 
-Renovate (`.github/renovate.json5`, hosted Mend app) covers all of them:
+Renovate (`renovate.json5`, hosted Mend app) covers all of them:
 - **Schedule:** it runs nightly (00:00-06:00 Europe/Paris), and grouped PRs
   merge themselves through GitHub auto-merge once the required checks pass.
   GitHub signs the squash commits, so they satisfy the signed-commit rule.
