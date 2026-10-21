@@ -59,6 +59,65 @@ paths:
                     type: object
                     description: Number of monitors per status
                     additionalProperties: { type: integer }
+  /api/v1/me:
+    get:
+      summary: The caller
+      description: Who the bearer token identifies and what it may do.
+      responses:
+        "200":
+          description: Caller
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [name, kind, scope]
+                properties:
+                  name: { type: string, description: "Token name, OIDC user (preferred_username, client_id or sub), or anonymous" }
+                  kind: { type: string, enum: [token, oidc, anonymous] }
+                  scope: { type: string, enum: [read, admin] }
+  /api/v1/stream:
+    get:
+      summary: Live changes (server-sent events)
+      description: |
+        One event per change; `data` is JSON on one line. Event names:
+        `transition` (an Event), `notification` (a Notification), `monitor`
+        (`{"id"}`: live state changed without a transition), `maintenance`
+        (`{}`), `reload` (`{}`), `resync` (`{}`: the client fell behind and
+        should read everything again). A `: keepalive` comment every 15 s.
+        At most 64 streams at once. The stream ends when the instance stops
+        leading or shuts down.
+      responses:
+        "200":
+          description: Event stream
+          content: { text/event-stream: { schema: { type: string } } }
+        "503": { $ref: "#/components/responses/Standby" }
+  /api/v1/rollups:
+    get:
+      summary: Hourly or daily aggregates of every monitor, in one request
+      parameters:
+        - { name: resolution, in: query, schema: { type: string, enum: [hour, day], default: hour } }
+        - { $ref: "#/components/parameters/From" }
+        - { $ref: "#/components/parameters/To" }
+        - { name: tag, in: query, schema: { type: string }, description: "Own or inherited tag" }
+        - { name: group, in: query, schema: { type: string }, description: "Group id, including nested groups" }
+      responses:
+        "200":
+          description: >-
+            Rollups by monitor id (every configured monitor matching the filters, `[]` without data).
+            Default range 24 hours (hour) or 30 days (day).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [resolution, from, to, monitors]
+                properties:
+                  resolution: { type: integer, enum: [3600, 86400] }
+                  from: { type: integer, format: int64 }
+                  to: { type: integer, format: int64 }
+                  monitors:
+                    type: object
+                    additionalProperties: { type: array, items: { $ref: "#/components/schemas/Rollup" } }
+        "400": { description: "Unknown resolution, or a range over 31 days (hour) or 400 days (day)", $ref: "#/components/responses/Error" }
   /api/v1/monitors:
     get:
       summary: List monitors with their live state
@@ -80,6 +139,64 @@ paths:
         "200": { description: "Monitor", content: { application/json: { schema: { $ref: "#/components/schemas/Monitor" } } } }
         "404": { $ref: "#/components/responses/Error" }
         "503": { $ref: "#/components/responses/Standby" }
+  /api/v1/monitors/{id}/config:
+    parameters: [{ $ref: "#/components/parameters/MonitorId" }]
+    get:
+      summary: Effective configuration, without secrets
+      description: |
+        Resolved settings (inheritance applied) and the check's options, by
+        allow-list: passwords, tokens, push tokens, header values, payloads
+        and credentials in URLs are never included.
+      responses:
+        "200":
+          description: Configuration
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [monitor, settings, check]
+                properties:
+                  monitor: { type: string }
+                  settings:
+                    type: object
+                    required:
+                      - enabled
+                      - interval_seconds
+                      - timeout_seconds
+                      - failure_threshold
+                      - recovery_threshold
+                      - renotify_every_seconds
+                      - notify_degraded
+                      - notify
+                      - depends_on
+                      - tags
+                    properties:
+                      enabled: { type: boolean }
+                      interval_seconds: { type: number }
+                      timeout_seconds: { type: number }
+                      failure_threshold: { type: integer }
+                      recovery_threshold: { type: integer }
+                      renotify_every_seconds: { type: number }
+                      notify_degraded: { type: boolean }
+                      flapping:
+                        oneOf:
+                          - type: object
+                            properties: { window_seconds: { type: number }, max_transitions: { type: integer } }
+                          - type: "null"
+                      degraded_latency_ms: { type: [number, "null"] }
+                      slo: { type: [number, "null"] }
+                      notify: { type: array, items: { type: string } }
+                      depends_on: { type: array, items: { type: string } }
+                      group: { type: [string, "null"] }
+                      tags: { type: array, items: { type: string } }
+                  check:
+                    type: object
+                    required: [type]
+                    description: Type-specific options (see docs/checks.md); durations as `<name>_seconds` or `<name>_ms`.
+                    properties:
+                      type: { $ref: "#/components/schemas/MonitorType" }
+                    additionalProperties: true
+        "404": { $ref: "#/components/responses/Error" }
   /api/v1/monitors/{id}/heartbeats:
     parameters: [{ $ref: "#/components/parameters/MonitorId" }]
     get:
@@ -170,6 +287,69 @@ paths:
       responses:
         "200": { $ref: "#/components/responses/Ok" }
         "404": { $ref: "#/components/responses/Error" }
+  /api/v1/monitors/{id}/ack:
+    parameters: [{ $ref: "#/components/parameters/MonitorId" }]
+    post:
+      summary: Acknowledge the current problem (admin); persisted
+      description: No reminders while acknowledged. Cleared when the monitor is up again.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties: { comment: { type: string, maxLength: 512 } }
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { description: "The monitor is not down, pending or degraded, or disabled", $ref: "#/components/responses/Error" }
+  /api/v1/monitors/{id}/unack:
+    parameters: [{ $ref: "#/components/parameters/MonitorId" }]
+    post:
+      summary: Withdraw an acknowledgement (admin)
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "404": { $ref: "#/components/responses/Error" }
+  /api/v1/monitors/{id}/silence:
+    parameters: [{ $ref: "#/components/parameters/MonitorId" }]
+    post:
+      summary: Silence the monitor's notifications (admin); persisted
+      description: |
+        Every notification about the monitor is suppressed until the silence
+        ends (at most 7 days). Transitions meanwhile record
+        `suppressed_reason: "silenced by <who> until <RFC 3339>"`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              description: Set `duration` or `until`.
+              properties:
+                duration: { type: string, examples: ["2h"] }
+                until: { type: integer, format: int64 }
+      responses:
+        "200":
+          description: Silenced
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, silenced_until]
+                properties: { ok: { type: boolean }, silenced_until: { type: integer, format: int64 } }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { description: "Monitor disabled in the configuration", $ref: "#/components/responses/Error" }
+  /api/v1/monitors/{id}/unsilence:
+    parameters: [{ $ref: "#/components/parameters/MonitorId" }]
+    post:
+      summary: Lift a silence (admin)
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "404": { $ref: "#/components/responses/Error" }
   /api/v1/groups:
     get:
       summary: Groups with their aggregated status
@@ -197,22 +377,51 @@ paths:
   /api/v1/maintenance:
     get:
       summary: Maintenance windows and whether they are active
+      description: Configured windows, then windows created through the API (listed until a week after they end).
       responses:
         "200":
           description: Windows
           content:
             application/json:
-              schema:
-                type: array
-                items:
-                  type: object
-                  required: [id, active, monitors]
-                  properties:
-                    id: { type: string }
-                    description: { type: [string, "null"] }
-                    active: { type: boolean }
-                    active_until: { type: [integer, "null"], format: int64 }
-                    monitors: { type: array, items: { type: string } }
+              schema: { type: array, items: { $ref: "#/components/schemas/MaintenanceWindow" } }
+    post:
+      summary: Start a maintenance window (admin)
+      description: Stored in the database; applies like a one-off configured window.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              description: A non-empty selection, and `end` or `duration`.
+              properties:
+                id: { type: string, description: "Default api-<ms>" }
+                description: { type: string, maxLength: 1024 }
+                monitors: { type: array, items: { type: string } }
+                groups: { type: array, items: { type: string } }
+                tags: { type: array, items: { type: string } }
+                all: { type: boolean }
+                start: { type: integer, format: int64, description: "Default now; at most 30 days ahead" }
+                end: { type: integer, format: int64 }
+                duration: { type: string, examples: ["1h"] }
+      responses:
+        "201":
+          description: Created
+          content: { application/json: { schema: { $ref: "#/components/schemas/MaintenanceWindow" } } }
+        "400": { description: "Invalid request (selection, unknown ids, times, longer than 30 days)", $ref: "#/components/responses/Error" }
+        "409": { description: "A window with this id exists", $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Standby" }
+  /api/v1/maintenance/{id}/end:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+    post:
+      summary: End a window created through the API now (admin)
+      responses:
+        "200":
+          description: Ended
+          content: { application/json: { schema: { $ref: "#/components/schemas/MaintenanceWindow" } } }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { description: "A configured window (change the configuration)", $ref: "#/components/responses/Error" }
   /api/v1/events:
     get:
       summary: Status transitions of all monitors (default last 24 hours)
@@ -254,6 +463,10 @@ paths:
         - { $ref: "#/components/parameters/From" }
         - { $ref: "#/components/parameters/To" }
         - { $ref: "#/components/parameters/Limit" }
+        - { name: monitor, in: query, schema: { type: string } }
+        - { name: notifier, in: query, schema: { type: string } }
+        - { name: success, in: query, schema: { type: boolean } }
+        - { name: event, in: query, schema: { $ref: "#/components/schemas/EventKind" } }
       responses:
         "200":
           description: Deliveries
@@ -278,6 +491,7 @@ paths:
                         event: { $ref: "#/components/schemas/EventKind" }
                         success: { type: boolean }
                         error: { type: [string, "null"] }
+        "400": { description: "Invalid success or event", $ref: "#/components/responses/Error" }
   /api/v1/reload:
     post:
       summary: Reload the configuration (admin)
@@ -387,8 +601,26 @@ components:
         paused: { type: boolean }
         flapping: { type: boolean }
         maintenance: { type: [string, "null"], description: "Active maintenance window id" }
-        cert_expiry: { type: [integer, "null"], format: int64, description: "Seconds since epoch (TLS monitors)" }
+        cert_expiry:
+          type: [integer, "null"]
+          format: int64
+          deprecated: true
+          description: "Seconds since epoch (TLS monitors); use cert_expires_at"
+        cert_expires_at: { type: [integer, "null"], format: int64, description: "Certificate expiry, ms since epoch (TLS monitors)" }
         consecutive_failures: { type: integer }
+        slo: { type: [number, "null"], description: "Configured uptime target in percent" }
+        acknowledged:
+          description: The current problem was acknowledged (no reminders until it is over)
+          oneOf:
+            - type: object
+              required: [by, at]
+              properties:
+                by: { type: string, description: "Principal, e.g. oidc:alice" }
+                at: { type: integer, format: int64 }
+                comment: { type: [string, "null"] }
+            - type: "null"
+        silenced_until: { type: [integer, "null"], format: int64, description: "Notifications suppressed until then" }
+        silenced_by: { type: [string, "null"] }
     Heartbeat:
       type: object
       required: [ts, status]
@@ -431,6 +663,20 @@ components:
         latency_count: { type: integer }
         latency_min_us: { type: [integer, "null"], format: int64 }
         latency_max_us: { type: [integer, "null"], format: int64 }
+    MaintenanceWindow:
+      type: object
+      required: [id, active, monitors, source, recurring]
+      properties:
+        id: { type: string }
+        description: { type: [string, "null"] }
+        active: { type: boolean }
+        active_until: { type: [integer, "null"], format: int64 }
+        monitors: { type: array, items: { type: string } }
+        source: { type: string, enum: [config, api] }
+        start: { type: [integer, "null"], format: int64, description: "Null for recurring windows" }
+        end: { type: [integer, "null"], format: int64, description: "Null for recurring windows" }
+        recurring: { type: boolean }
+        created_by: { type: [string, "null"], description: "Principal that created an API window" }
     Group:
       type: object
       required: [id, name, tags, status, monitors, groups]

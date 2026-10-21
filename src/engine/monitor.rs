@@ -16,12 +16,15 @@ use crate::checks::{Check, CheckResult};
 use crate::config::{Dur, MonitorConfig};
 use crate::model::{Outcome, Status, now_ms};
 use crate::notify::Notification;
-use crate::store::{EventRecord, Heartbeat};
+use crate::store::{Acknowledgement, EventRecord, Heartbeat, Silence};
 
 pub enum Command {
     RunNow,
     Push(PushReport),
     Pause(bool, oneshot::Sender<()>),
+    /// Acknowledge (or with `None` withdraw); fails with the current status.
+    Ack(Option<Acknowledgement>, oneshot::Sender<Result<(), Status>>),
+    Silence(Option<Silence>, oneshot::Sender<()>),
 }
 
 pub struct PushReport {
@@ -129,6 +132,25 @@ impl MonitorTask {
                         self.apply_effects(&fx, None, now_ms());
                         self.publish_live(None, None);
                         let _ = ack.send(());
+                    }
+                    Some(Command::Ack(ack, reply)) => {
+                        let result = match ack {
+                            Some(a) => self.state.acknowledge(a).map_err(|e| e.0),
+                            None => Ok(self.state.unacknowledge()),
+                        };
+                        let result = result.map(|fx| {
+                            tracing::info!(monitor = %self.config.id, acknowledged = self.state.ack.is_some(), "acknowledgement changed");
+                            self.apply_effects(&fx, None, now_ms());
+                            self.publish_live(None, None);
+                        });
+                        let _ = reply.send(result);
+                    }
+                    Some(Command::Silence(silence, reply)) => {
+                        let fx = self.state.set_silence(silence);
+                        tracing::info!(monitor = %self.config.id, until = ?self.state.silence.as_ref().map(|s| s.until), "silence changed");
+                        self.apply_effects(&fx, None, now_ms());
+                        self.publish_live(None, None);
+                        let _ = reply.send(());
                     }
                 }
             }
@@ -288,6 +310,10 @@ impl MonitorTask {
         entry.paused = self.state.paused;
         entry.flapping = self.state.flapping;
         entry.consecutive_failures = self.state.fails;
+        entry.acknowledged = self.state.ack.clone();
+        let silence = self.state.silenced(now_ms());
+        entry.silenced_until = silence.map(|s| s.until);
+        entry.silenced_by = silence.map(|s| s.by.clone());
         if let (Some(r), Some(ts)) = (result, ts) {
             entry.last_check = Some(ts);
             entry.outcome = Some(r.outcome.status());
@@ -295,6 +321,7 @@ impl MonitorTask {
             entry.message = Some(r.message.clone());
             if r.cert_expiry.is_some() {
                 entry.cert_expiry = r.cert_expiry;
+                entry.cert_expires_at = r.cert_expiry.map(|s| s.saturating_mul(1000));
             }
         }
         entry.maintenance = (self.state.status == Status::Maintenance)

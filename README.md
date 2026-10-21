@@ -20,8 +20,11 @@ people who keep their infrastructure in code.
   Pushover and email.
 - **Groups and tags.** Groups nest, pass down settings and tags, and have an
   aggregated status.
-- **Headless.** A JSON API ([OpenAPI](docs/openapi.yaml)) for UIs, plus
-  Prometheus `/metrics`.
+- **Headless.** A JSON API ([OpenAPI](docs/openapi.yaml)) for UIs, with a
+  live event stream (SSE), plus Prometheus `/metrics`.
+- **Runtime actions** without touching the configuration: run now, pause,
+  acknowledge an outage (no reminders), silence a monitor, start a short
+  maintenance window. Each is audited with the caller.
 - **Small.** About 5 MiB of RAM, measured with 15 monitors of every type, and an 8 MB image
   holding one static binary. The image is built on Docker Hardened Images and runs unprivileged,
   read-only and without any capability.

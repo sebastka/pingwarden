@@ -271,3 +271,41 @@ fn loads_directories_in_order() {
     assert_eq!(ids, ["web", "dns"]);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn slo_is_inherited_and_validated() {
+    let c = parse(
+        r#"
+defaults: { slo: 99.5 }
+groups:
+  - { id: web, defaults: { slo: 99.9 } }
+monitors:
+  - { id: a, type: icmp, host: 192.0.2.1, group: web }
+  - { id: b, type: icmp, host: 192.0.2.2 }
+  - { id: c, type: icmp, host: 192.0.2.3, group: web, slo: 95 }
+"#,
+    )
+    .unwrap();
+    let slo: Vec<_> = c.monitors.iter().map(|m| m.slo).collect();
+    assert_eq!(slo, [Some(99.9), Some(99.5), Some(95.0)]);
+    assert_eq!(
+        parse("monitors: [{ id: d, type: icmp, host: 192.0.2.4 }]")
+            .unwrap()
+            .monitors[0]
+            .slo,
+        None
+    );
+
+    let e = parse(
+        r#"
+defaults: { slo: 100 }
+groups: [{ id: g, defaults: { slo: 0 } }]
+monitors: [{ id: m, type: icmp, host: 192.0.2.1, slo: -1 }]
+"#,
+    )
+    .unwrap_err()
+    .to_string();
+    for owner in ["defaults.slo", "groups.g.defaults.slo", "monitors.m.slo"] {
+        assert!(e.contains(&format!("{owner}: must be a percentage")), "{owner}: {e}");
+    }
+}

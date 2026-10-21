@@ -1,14 +1,18 @@
 //! Maintenance windows: one-off or weekly-recurring periods during which
 //! checks still run but results are recorded as `maintenance` and no
-//! notification is sent.
+//! notification is sent. Windows come from the configuration, or are created
+//! at runtime through the API (one-off only, at most 30 days).
 
 use std::collections::HashSet;
+
+use serde::Deserialize;
 
 use jiff::civil::{Date, Weekday as JWeekday};
 use jiff::tz::TimeZone;
 use jiff::{Span, Timestamp};
 
-use crate::config::{MaintenanceConfig, MonitorConfig, Weekday};
+use crate::config::{Config, Dur, MaintenanceConfig, MonitorConfig, Weekday, valid_id};
+use crate::store::{RuntimeWindow, WindowSelection};
 
 #[derive(Clone, Debug)]
 pub struct Window {
@@ -19,6 +23,8 @@ pub struct Window {
     tags: HashSet<String>,
     groups: HashSet<String>,
     schedule: Schedule,
+    /// Who created the window through the API; `None` for configured windows.
+    pub created_by: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -37,6 +43,8 @@ enum Schedule {
 }
 
 const MAX_RECURRING_DURATION_MS: i64 = 7 * 86_400_000;
+/// Longest runtime window, and how far ahead one may start.
+pub const MAX_RUNTIME_SPAN_MS: i64 = 30 * 86_400_000;
 
 impl Window {
     pub fn parse(cfg: &MaintenanceConfig) -> Result<Self, String> {
@@ -87,7 +95,33 @@ impl Window {
             tags: cfg.tags.iter().cloned().collect(),
             groups: cfg.groups.iter().cloned().collect(),
             schedule,
+            created_by: None,
         })
+    }
+
+    /// A window created through the API.
+    pub fn from_runtime(w: &RuntimeWindow) -> Self {
+        Self {
+            id: w.id.clone(),
+            description: w.description.clone(),
+            all: w.selection.all,
+            monitors: w.selection.monitors.iter().cloned().collect(),
+            tags: w.selection.tags.iter().cloned().collect(),
+            groups: w.selection.groups.iter().cloned().collect(),
+            schedule: Schedule::OneOff {
+                start_ms: w.start_ms,
+                end_ms: w.end_ms,
+            },
+            created_by: Some(w.created_by.clone()),
+        }
+    }
+
+    /// Start and end of a one-off window; `None` for recurring ones.
+    pub fn bounds(&self) -> Option<(i64, i64)> {
+        match self.schedule {
+            Schedule::OneOff { start_ms, end_ms } => Some((start_ms, end_ms)),
+            Schedule::Recurring { .. } => None,
+        }
     }
 
     pub fn monitor_ids(&self) -> impl Iterator<Item = &str> {
@@ -138,6 +172,96 @@ impl Window {
             }
         }
     }
+}
+
+/// Body of `POST /api/v1/maintenance`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowRequest {
+    pub id: Option<String>,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub monitors: Vec<String>,
+    #[serde(default)]
+    pub groups: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub all: bool,
+    /// Milliseconds since the epoch; now when unset.
+    pub start: Option<i64>,
+    /// Milliseconds since the epoch; or set `duration`.
+    pub end: Option<i64>,
+    /// E.g. `"1h"`; or set `end`.
+    pub duration: Option<String>,
+}
+
+/// Validate a runtime window request against the configuration. The caller
+/// still checks that the id is not taken by a stored runtime window.
+pub fn runtime_window(req: WindowRequest, by: &str, now: i64, config: &Config) -> Result<RuntimeWindow, String> {
+    let id = match req.id {
+        Some(id) if !valid_id(&id) => {
+            return Err(format!(
+                "invalid id {id:?} (letters, digits, `_`, `-`, `.`; at most 128 characters)"
+            ));
+        }
+        Some(id) => id,
+        None => format!("api-{now}"),
+    };
+    if let Some(d) = &req.description
+        && d.chars().count() > 1024
+    {
+        return Err("description is longer than 1024 characters".into());
+    }
+    if !req.all && req.monitors.is_empty() && req.groups.is_empty() && req.tags.is_empty() {
+        return Err("select monitors with `monitors`, `groups`, `tags` or `all: true`".into());
+    }
+    for m in &req.monitors {
+        if !config.monitors.iter().any(|c| &c.id == m) {
+            return Err(format!("unknown monitor `{m}`"));
+        }
+    }
+    for g in &req.groups {
+        if !config.groups.iter().any(|c| &c.id == g) {
+            return Err(format!("unknown group `{g}`"));
+        }
+    }
+    let start = req.start.unwrap_or(now);
+    if start > now + MAX_RUNTIME_SPAN_MS {
+        return Err("`start` may be at most 30 days ahead".into());
+    }
+    let end = match (req.end, req.duration.as_deref()) {
+        (Some(_), Some(_)) => return Err("set `end` or `duration`, not both".into()),
+        (None, None) => return Err("set `end` or `duration`".into()),
+        (Some(end), None) => end,
+        (None, Some(d)) => {
+            let d: Dur = d.parse().map_err(|e| format!("{e}"))?;
+            start.saturating_add(d.as_millis_i64())
+        }
+    };
+    if end <= start {
+        return Err("the window must end after it starts".into());
+    }
+    if end <= now {
+        return Err("the window must end in the future".into());
+    }
+    if end - start > MAX_RUNTIME_SPAN_MS {
+        return Err("a window may last at most 30 days".into());
+    }
+    Ok(RuntimeWindow {
+        id,
+        description: req.description,
+        selection: WindowSelection {
+            all: req.all,
+            monitors: req.monitors,
+            groups: req.groups,
+            tags: req.tags,
+        },
+        start_ms: start,
+        end_ms: end,
+        created_by: by.to_owned(),
+        created_at: now,
+    })
 }
 
 fn sub_days(date: Date, days: i64) -> Option<Date> {
@@ -219,6 +343,64 @@ mod tests {
         // Saturday 2026-10-31 23:30 CET (+01:00) = 22:30Z after DST ended.
         assert!(w.active_until(ms("2026-10-31T21:45:00Z")).is_none());
         assert!(w.active_until(ms("2026-10-31T22:45:00Z")).is_some());
+    }
+
+    #[test]
+    fn validates_runtime_requests() {
+        let config = crate::config::from_str(
+            r#"
+database: { url: "postgres://x@db/x" }
+groups: [{ id: web }]
+monitors:
+  - { id: site, type: tcp, host: example.com, port: 443, group: web }
+"#,
+        )
+        .unwrap();
+        let now = 1_000_000_000_000;
+        let req = |f: fn(&mut WindowRequest)| {
+            let mut r = WindowRequest {
+                monitors: vec!["site".into()],
+                duration: Some("1h".into()),
+                ..WindowRequest::default()
+            };
+            f(&mut r);
+            runtime_window(r, "oidc:alice", now, &config)
+        };
+        let ok = req(|_| {}).unwrap();
+        assert_eq!((ok.start_ms, ok.end_ms), (now, now + 3_600_000));
+        assert_eq!(ok.id, format!("api-{now}"));
+        assert_eq!(ok.created_by, "oidc:alice");
+        let w = Window::from_runtime(&ok);
+        assert_eq!(w.active_until(now + 1), Some(now + 3_600_000));
+        assert_eq!(w.bounds(), Some((now, now + 3_600_000)));
+
+        let err = |f: fn(&mut WindowRequest)| req(f).unwrap_err();
+        assert!(err(|r| r.monitors.clear()).contains("select monitors"));
+        assert!(err(|r| r.monitors = vec!["nope".into()]).contains("unknown monitor"));
+        assert!(err(|r| r.groups = vec!["nope".into()]).contains("unknown group"));
+        assert!(err(|r| r.id = Some("no spaces".into())).contains("invalid id"));
+        assert!(err(|r| r.end = Some(1)).contains("not both"));
+        assert!(err(|r| r.duration = None).contains("set `end` or `duration`"));
+        assert!(err(|r| r.duration = Some("31d".into())).contains("at most 30 days"));
+        assert!(err(|r| r.duration = Some("soon".into())).contains("invalid duration"));
+        assert!(err(|r| r.start = Some(1_000_000_000_000 + 31 * 86_400_000)).contains("30 days ahead"));
+        assert!(err(|r| r.start = Some(1)).contains("end in the future"));
+        assert!(
+            err(|r| {
+                r.duration = None;
+                r.start = Some(1_000_000_000_000 + 10);
+                r.end = Some(1_000_000_000_000 + 5);
+            })
+            .contains("end after it starts")
+        );
+        assert!(
+            req(|r| {
+                r.monitors.clear();
+                r.groups = vec!["web".into()];
+                r.tags = vec!["any".into()];
+            })
+            .is_ok()
+        );
     }
 
     #[test]
