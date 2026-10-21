@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use axum::Extension;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -15,8 +16,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
-use crate::config::{Config, Endpoints, MonitorConfig, TokenScope};
+use crate::auth::{AuthError, OidcVerifier, Principal, looks_like_jwt};
+use crate::config::{Config, CorsConfig, Endpoints, MonitorConfig, TokenScope};
 use crate::engine::{CommandError, Engine, LiveView, PushReport};
 use crate::metrics::Metrics;
 use crate::model::{Outcome, Status, now_ms};
@@ -30,6 +33,8 @@ pub struct AppState {
     pub store: Store,
     pub metrics: Metrics,
     pub reload: mpsc::Sender<ReloadRequest>,
+    /// Set when `server.auth.oidc` is configured.
+    pub oidc: Option<Arc<OidcVerifier>>,
 }
 
 impl AppState {
@@ -67,7 +72,30 @@ pub fn router(state: AppStateRef, serve: &[Endpoints]) -> Router {
     if serve.contains(&Endpoints::Push) {
         v1 = v1.route("/push/{token}", get(push).post(push));
     }
-    root.nest("/api/v1", v1).with_state(state)
+    let cors = state.config().server.cors.as_ref().map(cors_layer);
+    let router = root.nest("/api/v1", v1).with_state(state);
+    // Outermost, so that preflight requests are answered before authentication.
+    match cors {
+        Some(layer) => router.layer(layer),
+        None => router,
+    }
+}
+
+fn cors_layer(c: &CorsConfig) -> CorsLayer {
+    let origins = if c.allowed_origins.iter().any(|o| o == "*") {
+        AllowOrigin::any()
+    } else {
+        AllowOrigin::list(
+            c.allowed_origins
+                .iter()
+                .filter_map(|o| header::HeaderValue::from_str(o).ok()),
+        )
+    };
+    CorsLayer::new()
+        .allow_origin(origins)
+        .allow_methods([Method::GET, Method::HEAD, Method::POST])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        .max_age(c.max_age.0)
 }
 
 fn api_routes(state: AppStateRef) -> Router<AppStateRef> {
@@ -149,35 +177,77 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .map(str::trim)
 }
 
-fn scope_of(config: &Config, headers: &HeaderMap) -> Option<TokenScope> {
-    let presented = bearer(headers)?;
+fn static_principal(config: &Config, presented: &str) -> Option<Principal> {
     // Check every token, so the time taken does not depend on which matched.
     config
         .server
         .api_tokens
         .iter()
         .filter(|t| token_eq(&t.token, presented))
-        .map(|t| t.scope)
-        .max()
+        .max_by_key(|t| t.scope)
+        .map(|t| Principal {
+            name: format!("token:{}", t.name),
+            scope: Some(t.scope),
+        })
 }
 
-async fn api_auth(State(state): State<AppStateRef>, req: Request, next: Next) -> Response {
+fn unauthorized(message: &str) -> Response {
+    let mut r = ApiError(StatusCode::UNAUTHORIZED, message.into()).into_response();
+    r.headers_mut()
+        .insert(header::WWW_AUTHENTICATE, header::HeaderValue::from_static("Bearer"));
+    r
+}
+
+/// Identify the caller: a static API token, an OIDC access token, or
+/// anonymous when `anonymous_read` allows it and no token was presented.
+async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<Principal, Response> {
     let config = state.config();
+    let Some(presented) = bearer(headers) else {
+        return if config.server.anonymous_read {
+            Ok(Principal {
+                name: "anonymous".into(),
+                scope: Some(TokenScope::Read),
+            })
+        } else {
+            Err(unauthorized("missing bearer token"))
+        };
+    };
+    if let Some(p) = static_principal(&config, presented) {
+        return Ok(p);
+    }
+    match &state.oidc {
+        Some(verifier) if looks_like_jwt(presented) => match verifier.verify(presented).await {
+            Ok(p) => Ok(p),
+            Err(AuthError::Unavailable(e)) => {
+                tracing::error!(error = %e, "cannot validate an OIDC token: signing keys unavailable");
+                Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "token validation unavailable".into()).into_response())
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "rejected OIDC token");
+                Err(unauthorized(&format!("invalid token: {e}")))
+            }
+        },
+        _ => Err(unauthorized("invalid bearer token")),
+    }
+}
+
+async fn api_auth(State(state): State<AppStateRef>, mut req: Request, next: Next) -> Response {
     let needed = if req.method() == Method::GET || req.method() == Method::HEAD {
         TokenScope::Read
     } else {
         TokenScope::Admin
     };
-    let granted = scope_of(&config, req.headers()).or((config.server.anonymous_read).then_some(TokenScope::Read));
-    match granted {
-        Some(s) if s >= needed => next.run(req).await,
-        Some(_) => ApiError(StatusCode::FORBIDDEN, "admin token required".into()).into_response(),
-        None => {
-            let mut r = ApiError(StatusCode::UNAUTHORIZED, "missing or invalid bearer token".into()).into_response();
-            r.headers_mut()
-                .insert(header::WWW_AUTHENTICATE, header::HeaderValue::from_static("Bearer"));
-            r
+    let principal = match authenticate(&state, req.headers()).await {
+        Ok(p) => p,
+        Err(response) => return response,
+    };
+    match principal.scope {
+        Some(s) if s >= needed => {
+            req.extensions_mut().insert(principal);
+            next.run(req).await
         }
+        Some(_) => ApiError(StatusCode::FORBIDDEN, "admin access required".into()).into_response(),
+        None => ApiError(StatusCode::FORBIDDEN, "the token grants no access to Pingwarden".into()).into_response(),
     }
 }
 
@@ -433,18 +503,33 @@ async fn rollups(
     Ok(Json(json!({ "monitor": id, "resolution": res, "rollups": rows })))
 }
 
-async fn run_now(State(state): State<AppStateRef>, Path(id): Path<String>) -> ApiResult<Value> {
+async fn run_now(
+    State(state): State<AppStateRef>,
+    Extension(who): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<Value> {
     state.engine()?.run_now(&id).await?;
+    tracing::info!(principal = %who.name, monitor = %id, "check run requested");
     Ok(Json(json!({ "ok": true })))
 }
 
-async fn pause(State(state): State<AppStateRef>, Path(id): Path<String>) -> ApiResult<Value> {
+async fn pause(
+    State(state): State<AppStateRef>,
+    Extension(who): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<Value> {
     state.engine()?.set_paused(&id, true).await?;
+    tracing::info!(principal = %who.name, monitor = %id, "monitor paused");
     Ok(Json(json!({ "ok": true, "paused": true })))
 }
 
-async fn resume(State(state): State<AppStateRef>, Path(id): Path<String>) -> ApiResult<Value> {
+async fn resume(
+    State(state): State<AppStateRef>,
+    Extension(who): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<Value> {
     state.engine()?.set_paused(&id, false).await?;
+    tracing::info!(principal = %who.name, monitor = %id, "monitor resumed");
     Ok(Json(json!({ "ok": true, "paused": false })))
 }
 
@@ -537,8 +622,13 @@ async fn notifiers(State(state): State<AppStateRef>) -> ApiResult<Value> {
     Ok(Json(json!(out)))
 }
 
-async fn test_notifier(State(state): State<AppStateRef>, Path(id): Path<String>) -> ApiResult<Value> {
+async fn test_notifier(
+    State(state): State<AppStateRef>,
+    Extension(who): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<Value> {
     let engine = state.engine()?;
+    tracing::info!(principal = %who.name, notifier = %id, "test notification requested");
     match engine.dispatcher().test(&id).await {
         Ok(()) => Ok(Json(json!({ "ok": true }))),
         Err(e) if e.starts_with("unknown notifier") => Err(not_found("notifier")),
@@ -564,7 +654,8 @@ async fn status(State(state): State<AppStateRef>) -> ApiResult<Value> {
     })))
 }
 
-async fn reload(State(state): State<AppStateRef>) -> ApiResult<Value> {
+async fn reload(State(state): State<AppStateRef>, Extension(who): Extension<Principal>) -> ApiResult<Value> {
+    tracing::info!(principal = %who.name, "configuration reload requested");
     let (tx, rx) = oneshot::channel();
     state
         .reload

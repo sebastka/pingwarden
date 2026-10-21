@@ -54,8 +54,73 @@ A complete example is in [`examples/config.yaml`](../examples/config.yaml).
 | `api_tokens` | `[]` | `{name, token, scope}` entries. `scope` is `read` (GET endpoints) or `admin` (everything). Tokens are at least 16 characters long. |
 | `anonymous_read` | `false` | Serve read endpoints without a token. |
 | `metrics_token` | unset | Bearer token required by `/metrics`; it is open when unset. |
+| `auth.oidc` | unset | Accept access tokens from an OpenID Connect provider; see below. |
+| `cors` | unset | Let browser UIs on other origins call the API; see below. |
 
 `/healthz`, `/readyz` and `/api/v1/push/{token}` never need an API token.
+
+### OpenID Connect
+
+With `server.auth.oidc`, the API also accepts JWT access tokens from your
+identity provider (Keycloak, Authentik, Zitadel, …). Static `api_tokens`
+keep working, for scripts and simple setups. Pingwarden never issues
+tokens: browser UIs sign users in with the provider (authorization code with
+PKCE), and machines use the client-credentials grant.
+
+```yaml
+server:
+  auth:
+    oidc:
+      issuer: https://auth.example.com/realms/home   # exactly the tokens' `iss`
+      audience: pingwarden          # or a list; a token needs one of them in `aud`
+      claim: realm_access.roles     # where permissions are, see below
+      read: [pingwarden-read]       # values granting read access
+      admin: [pingwarden-admin]     # values granting admin (and read) access
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `issuer` | required | `https://`; `http://` only for `localhost`. |
+| `audience` | required | String or list. |
+| `claim` | `scope` | A space-separated string (`scope`) or a list (`groups`, `roles`). Dots descend into objects: `realm_access.roles`, `resource_access.pingwarden.roles`. |
+| `read`, `admin` | `[]` | At least one must be set. A token matching neither is rejected with 403. |
+| `jwks_url` | discovered | Signing keys URL; by default read from `{issuer}/.well-known/openid-configuration`. |
+| `jwks_refresh` | `1h` | Key refresh period. A token naming an unknown key also triggers a refresh, at most every 30 s. |
+| `leeway` | `60s` | Clock skew tolerated on `exp` and `nbf`. |
+
+- **Accepted signatures:** RS256/384/512, PS256/384/512, ES256, ES384 and
+  EdDSA. Unsigned (`none`) and shared-secret (HS*) tokens are refused.
+- **Required claims:** tokens need `exp`. `iss`, `aud` and `nbf` (when
+  present) are checked.
+- **Audit:** admin actions are logged with the caller. For OIDC tokens that
+  is `oidc:<name>`, where the name comes from `preferred_username`, else
+  `client_id`, else `sub`. For static tokens it is `token:<name>`.
+- **Internal CAs:** a provider behind an internal CA needs it in
+  `tls.ca_files`.
+
+Provider notes:
+- **Keycloak** puts realm roles in `realm_access.roles`, and client roles in
+  `resource_access.<client>.roles`. Its access tokens carry
+  `aud: account` unless you add an *audience* mapper (`Included Custom
+  Audience: pingwarden`) to the client, or to a client scope it uses.
+- **Authentik** puts groups in `groups` (scope `profile`). Its audience is
+  the provider's client id.
+
+### CORS
+
+A browser UI served from another origin needs `server.cors`:
+
+```yaml
+server:
+  cors:
+    allowed_origins: ["https://pingwarden-ui.example.com", "http://localhost:5173"]
+    max_age: 10m   # preflight cache
+```
+
+Origins are `scheme://host[:port]` without path, or `*` alone for any. Only
+`GET`, `HEAD` and `POST` with the `Authorization` and `Content-Type` headers
+are allowed. Credentials (cookies) are never involved: the API takes bearer
+tokens only.
 
 ### Listeners
 

@@ -52,6 +52,47 @@ pub fn validate(c: &Config) -> Result<(), ConfigError> {
             err(format!("server.api_tokens.{}: token is reused", t.name));
         }
     }
+    if let Some(o) = &c.server.auth.oidc {
+        match url::Url::parse(&o.issuer) {
+            Ok(u) if u.scheme() == "https" || is_local(&u) => {}
+            Ok(_) => err("server.auth.oidc.issuer must use https (http is accepted for localhost only)".into()),
+            Err(e) => err(format!("server.auth.oidc.issuer: {e}")),
+        }
+        if let Some(j) = &o.jwks_url {
+            match url::Url::parse(j) {
+                Ok(u) if u.scheme() == "https" || is_local(&u) => {}
+                Ok(_) => err("server.auth.oidc.jwks_url must use https (http is accepted for localhost only)".into()),
+                Err(e) => err(format!("server.auth.oidc.jwks_url: {e}")),
+            }
+        }
+        if o.audience.to_vec().iter().all(|a| a.is_empty()) {
+            err("server.auth.oidc.audience must not be empty".into());
+        }
+        if o.read.is_empty() && o.admin.is_empty() {
+            err("server.auth.oidc: set `read` and/or `admin` claim values".into());
+        }
+        if o.claim.is_empty() || o.claim.split('.').any(str::is_empty) {
+            err("server.auth.oidc.claim must be a dotted claim path, e.g. `scope` or `realm_access.roles`".into());
+        }
+        if o.jwks_refresh.0 < Duration::from_secs(60) {
+            err("server.auth.oidc.jwks_refresh must be at least 1m".into());
+        }
+    }
+    if let Some(cors) = &c.server.cors {
+        if cors.allowed_origins.is_empty() {
+            err("server.cors.allowed_origins must not be empty".into());
+        }
+        for o in &cors.allowed_origins {
+            if o != "*" && !valid_origin(o) {
+                err(format!(
+                    "server.cors.allowed_origins: {o:?} is not an origin (scheme://host[:port], no path), nor `*`"
+                ));
+            }
+        }
+        if cors.allowed_origins.len() > 1 && cors.allowed_origins.iter().any(|o| o == "*") {
+            err("server.cors.allowed_origins: `*` cannot be combined with other origins".into());
+        }
+    }
     if let Some(t) = &c.server.metrics_token
         && t.len() < MIN_SECRET_LEN
     {
@@ -273,6 +314,26 @@ pub fn validate(c: &Config) -> Result<(), ConfigError> {
     match errors.len() {
         0 => Ok(()),
         _ => Err(ConfigError::Many(errors)),
+    }
+}
+
+fn is_local(u: &url::Url) -> bool {
+    matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+}
+
+/// `scheme://host[:port]`, as browsers send it in the `Origin` header.
+fn valid_origin(o: &str) -> bool {
+    match url::Url::parse(o) {
+        Ok(u) => {
+            matches!(u.scheme(), "http" | "https")
+                && u.host_str().is_some()
+                && u.username().is_empty()
+                && u.path() == "/"
+                && u.query().is_none()
+                && u.fragment().is_none()
+                && !o.ends_with('/')
+        }
+        Err(_) => false,
     }
 }
 

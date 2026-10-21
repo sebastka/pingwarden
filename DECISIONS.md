@@ -364,6 +364,35 @@ Renovate (`renovate.json5`, hosted Mend app) covers all of them:
   follows the Rust shipped in the DHI build image, so it is bumped when a base
   image update brings a new Rust.
 
+### D28. OpenID Connect access tokens, validated locally
+- **Resource server only.** Pingwarden accepts JWT access tokens from an
+  existing provider and never issues tokens: running an authorization server
+  (clients, users, login pages, key rotation) does not belong in a headless
+  monitor. Browser UIs sign users in with the provider (authorization code
+  with PKCE); machines use client credentials at the provider.
+- **Static tokens stay.** Push tokens, the metrics token and `api_tokens`
+  serve cron jobs, Prometheus and scripts, which cannot run OAuth flows
+  easily. Both kinds of token are accepted side by side.
+- **Local validation with `ring`.** Signatures are verified with ring, which
+  rustls already uses, against keys discovered from the issuer (JWKS),
+  cached and refreshed hourly or on an unknown key id (rate-limited to once
+  per 30 s). `jsonwebtoken` was avoided: its pure-Rust backend depends on
+  the `rsa` crate, which has an open advisory (timing side channel) that
+  cargo-deny would flag. No session state, no introspection round-trip.
+- **Strict checks.** Asymmetric algorithms only (never `none` or HMAC); the
+  key's declared algorithm must match the header; `exp` is required;
+  `iss`, `aud` and `nbf` are checked with a configurable leeway. A
+  configured audience is mandatory, so tokens minted for other applications
+  of the same realm are refused.
+- **Permissions** map a claim (`scope`, `groups`, `realm_access.roles`, …)
+  to the existing `read` and `admin` levels. Admin actions are logged with
+  the caller's identity.
+- **CORS** (`server.cors`) is built in, since browser UIs on another origin
+  need it whatever the token type. Preflight requests are answered before
+  authentication; only bearer tokens are used, never cookies.
+- **Tested** against a mock provider (integration test) and a real
+  Keycloak 26 with the client-credentials grant and RS256 keys.
+
 ## Not done yet
 
 - **Stored OpenAPI spec.** `docs/openapi.yaml` is hand-written; generating it

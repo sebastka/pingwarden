@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::{self, AppState, ReloadRequest};
+use crate::auth::OidcVerifier;
 use crate::config::{self, Config};
 use crate::engine::Engine;
 use crate::metrics::Metrics;
@@ -40,12 +41,22 @@ pub async fn run(config_path: PathBuf, config: Config) -> anyhow::Result<()> {
 
     let (reload_tx, reload_rx) = mpsc::channel::<ReloadRequest>(4);
     spawn_sighup(reload_tx.clone(), shutdown.clone());
+    let oidc = match &config.server.auth.oidc {
+        Some(o) => {
+            let verifier = Arc::new(OidcVerifier::new(o.clone(), oidc_http_client(&config)?));
+            tokio::spawn(verifier.clone().refresh_loop(shutdown.clone()));
+            tracing::info!(issuer = %o.issuer, "OIDC access tokens accepted");
+            Some(verifier)
+        }
+        None => None,
+    };
     let state = Arc::new(AppState {
         config: RwLock::new(config.clone()),
         engine: RwLock::new(None),
         store: store.clone(),
         metrics: metrics.clone(),
         reload: reload_tx,
+        oidc,
     });
 
     // Bind every listener before serving any, so a bad address fails fast.
@@ -208,6 +219,23 @@ async fn load_blocking(path: &Path) -> Result<Arc<Config>, String> {
         .map_err(|e| e.to_string())?
         .map(Arc::new)
         .map_err(|e| e.to_string())
+}
+
+/// HTTP client for discovery and JWKS, trusting `tls.ca_files` too (for
+/// providers behind an internal CA).
+fn oidc_http_client(config: &Config) -> anyhow::Result<reqwest::Client> {
+    let (_, extra) = crate::checks::util::load_roots(&config.tls)?;
+    let certs: Vec<reqwest::Certificate> = extra
+        .iter()
+        .filter_map(|c| reqwest::Certificate::from_der(c).ok())
+        .collect();
+    let mut b = reqwest::Client::builder()
+        .user_agent(concat!("Pingwarden/", env!("CARGO_PKG_VERSION")))
+        .pool_max_idle_per_host(1);
+    if !certs.is_empty() {
+        b = b.tls_certs_merge(certs);
+    }
+    Ok(b.build()?)
 }
 
 async fn connect_with_retry(config: &Config) -> anyhow::Result<Store> {
