@@ -53,7 +53,7 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U pw" --health-interval 5s --health-timeout 5s --health-retries 20
       mariadb:
-        image: mariadb:11.8
+        image: mariadb:13.0
         env:
           MARIADB_ROOT_PASSWORD: root
           MARIADB_USER: pw
