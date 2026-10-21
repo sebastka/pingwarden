@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod app;
+pub mod auth;
 pub mod checks;
 pub mod config;
 pub mod engine;

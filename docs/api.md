@@ -3,10 +3,17 @@
 The machine-readable contract is [`openapi.yaml`](openapi.yaml) (OpenAPI 3.1);
 generate the UI client from it, for example with `openapi-typescript`.
 
-- **Authentication:** `Authorization: Bearer <token>` with a token from
-  `server.api_tokens`. `read` tokens may call GET endpoints; `admin` tokens
-  may call everything. `/healthz`, `/readyz` and `/api/v1/push/{token}` are
-  open, and `/metrics` is open unless `server.metrics_token` is set.
+- **Authentication:** `Authorization: Bearer <token>`, with either a static
+  token from `server.api_tokens` or an OpenID Connect access token (JWT)
+  when `server.auth.oidc` is set (see the [configuration
+  reference](configuration.md#openid-connect)). `read` access allows GET
+  endpoints; `admin` allows everything. `/healthz`, `/readyz` and
+  `/api/v1/push/{token}` are open, and `/metrics` is open unless
+  `server.metrics_token` is set.
+- **Status codes:** 401 for a missing, invalid or expired token; 403 for a
+  valid token without the needed access; 503 when the provider's signing
+  keys cannot be fetched.
+- **Browsers:** UIs on another origin need `server.cors`.
 - **Time:** timestamps are milliseconds since the Unix epoch (UTC). Ranges
   take `from` (inclusive) and `to` (exclusive); lists are newest first and
   capped by `limit` (default 500, at most 10,000).

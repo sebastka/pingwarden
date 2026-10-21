@@ -21,6 +21,7 @@ mimalloc = ["dep:mimalloc"]
 [dependencies]
 anyhow = "1.0.104"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "matched-path"] }
+base64 = "0.23.1"
 clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
 hickory-resolver = { version = "0.26.3", default-features = false, features = ["system-config", "tokio"] }
 jiff = { version = "0.2.38", default-features = false, features = ["std", "tz-system", "tzdb-bundle-always", "tzdb-zoneinfo"] }
@@ -30,6 +31,7 @@ prometheus-client = "0.25.1"
 rand = { version = "0.10.3", default-features = false, features = ["std", "thread_rng"] }
 regex = { version = "1.13.1", default-features = false, features = ["std", "perf", "unicode"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "form", "http2", "charset"] }
+ring = "0.17.14"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-native-certs = "0.8.5"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -43,6 +45,7 @@ thiserror = "2.0.21"
 tokio = { version = "1.54.0", features = ["rt", "rt-multi-thread", "macros", "net", "time", "signal", "sync", "io-util", "fs"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
 tokio-util = { version = "0.7.20", features = ["rt"] }
+tower-http = { version = "0.6.11", default-features = false, features = ["cors"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt", "ansi", "env-filter", "json"] }
 url = "2.5.8"

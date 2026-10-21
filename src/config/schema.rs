@@ -42,6 +42,91 @@ pub struct ServerConfig {
     pub anonymous_read: bool,
     /// Bearer token required by `/metrics`; open when unset.
     pub metrics_token: Option<String>,
+    /// Token validation besides `api_tokens`.
+    pub auth: AuthConfig,
+    /// Cross-origin access for browser UIs.
+    pub cors: Option<CorsConfig>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AuthConfig {
+    /// Accept JWT access tokens issued by an OpenID Connect provider.
+    pub oidc: Option<OidcConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OidcConfig {
+    /// Issuer URL, exactly as in the tokens' `iss` claim.
+    pub issuer: String,
+    /// Accepted `aud` values; a token must carry at least one.
+    pub audience: OneOrMany,
+    /// Claim holding the permissions: a space-separated string (`scope`) or
+    /// a list (`groups`, `roles`). Dots descend into objects, e.g.
+    /// `realm_access.roles`.
+    #[serde(default = "OidcConfig::default_claim")]
+    pub claim: String,
+    /// Claim values granting read access.
+    #[serde(default)]
+    pub read: Vec<String>,
+    /// Claim values granting admin access (which includes read).
+    #[serde(default)]
+    pub admin: Vec<String>,
+    /// JWKS URL; discovered from the issuer when unset.
+    pub jwks_url: Option<String>,
+    /// How often signing keys are refreshed.
+    #[serde(default = "OidcConfig::default_refresh")]
+    pub jwks_refresh: Dur,
+    /// Clock skew tolerated on `exp` and `nbf`.
+    #[serde(default = "OidcConfig::default_leeway")]
+    pub leeway: Dur,
+}
+
+impl OidcConfig {
+    fn default_claim() -> String {
+        "scope".into()
+    }
+    fn default_refresh() -> Dur {
+        Dur::secs(3600)
+    }
+    fn default_leeway() -> Dur {
+        Dur::secs(60)
+    }
+}
+
+/// A string or a list of strings.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    pub fn to_vec(&self) -> Vec<String> {
+        match self {
+            OneOrMany::One(s) => vec![s.clone()],
+            OneOrMany::Many(v) => v.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CorsConfig {
+    /// Origins allowed to call the API from a browser, e.g.
+    /// `https://ui.example.com`, or `*` for any.
+    pub allowed_origins: Vec<String>,
+    /// How long browsers may cache preflight responses.
+    #[serde(default = "CorsConfig::default_max_age")]
+    pub max_age: Dur,
+}
+
+impl CorsConfig {
+    fn default_max_age() -> Dur {
+        Dur::secs(600)
+    }
 }
 
 pub const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 8080);

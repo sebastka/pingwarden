@@ -17,6 +17,16 @@ server:
     - name: admin
       token: ${PINGWARDEN_ADMIN_TOKEN:-change-me-admin-token-0000}
       scope: admin
+  # Access tokens from an identity provider, e.g. for the web UI.
+  auth:
+    oidc:
+      issuer: https://auth.example.com/realms/home
+      audience: pingwarden
+      claim: realm_access.roles
+      read: [pingwarden-read]
+      admin: [pingwarden-admin]
+  cors:
+    allowed_origins: ["https://pingwarden-ui.example.com"]
 
 database:
   # postgres://… or mariadb://… (mysql:// works too)

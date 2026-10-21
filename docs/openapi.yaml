@@ -305,7 +305,12 @@ paths:
 
 components:
   securitySchemes:
-    bearer: { type: http, scheme: bearer }
+    bearer:
+      type: http
+      scheme: bearer
+      description: >-
+        A static token from `server.api_tokens`, or an OpenID Connect access
+        token (JWT) from the provider configured in `server.auth.oidc`.
   parameters:
     MonitorId: { name: id, in: path, required: true, schema: { type: string } }
     From: { name: from, in: query, schema: { type: integer, format: int64 }, description: "Inclusive, ms since epoch" }

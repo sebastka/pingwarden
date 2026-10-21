@@ -135,6 +135,57 @@ server:
 }
 
 #[test]
+fn oidc_and_cors_settings() {
+    let c = parse(
+        r#"
+server:
+  auth:
+    oidc:
+      issuer: https://auth.example.com/realms/home
+      audience: [pingwarden, pingwarden-ui]
+      claim: realm_access.roles
+      admin: [pw-admin]
+  cors:
+    allowed_origins: ["https://ui.example.com", "http://localhost:5173"]
+"#,
+    )
+    .unwrap();
+    let o = c.server.auth.oidc.unwrap();
+    assert_eq!(o.audience.to_vec(), ["pingwarden", "pingwarden-ui"]);
+    assert_eq!(o.leeway, Dur::secs(60));
+    assert_eq!(c.server.cors.unwrap().max_age, Dur::secs(600));
+
+    let e = parse(
+        r#"
+server:
+  auth:
+    oidc:
+      issuer: http://auth.example.com/realms/home
+      audience: ""
+      claim: "realm_access..roles"
+  cors:
+    allowed_origins: ["*", "https://ui.example.com/app", "ui.example.com"]
+"#,
+    )
+    .unwrap_err()
+    .to_string();
+    for needle in [
+        "issuer must use https",
+        "audience must not be empty",
+        "set `read` and/or `admin`",
+        "dotted claim path",
+        "\"https://ui.example.com/app\" is not an origin",
+        "\"ui.example.com\" is not an origin",
+        "`*` cannot be combined",
+    ] {
+        assert!(e.contains(needle), "missing {needle:?} in:\n{e}");
+    }
+    // http is fine for a local provider (development).
+    parse("server:\n  auth:\n    oidc: { issuer: \"http://localhost:8081/realms/dev\", audience: pw, read: [r] }\n")
+        .unwrap();
+}
+
+#[test]
 fn yaml_1_1_booleans_stay_strings() {
     let c = parse("monitors:\n  - { id: y, type: tcp, host: no, port: 1, tags: [on, off] }\n").unwrap();
     assert_eq!(c.monitors[0].id, "y");
