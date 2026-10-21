@@ -273,7 +273,7 @@ found an `id: y` turned into `true`.
   `dhi.io/alpine-base:3.24`, about 3 MB with a CA bundle and the non-root user
   65532.
 - **Index digests.** The Dockerfile pins multi-arch **index** digests, so
-  arm64 builds work and Dependabot can update them. The digests in the brief
+  arm64 builds work and Renovate can update them. The digests in the brief
   were amd64-only manifests.
 - **Syntax directive.** `# syntax=docker/dockerfile:1.28.0` is pinned by
   digest too.
@@ -305,8 +305,7 @@ found an `id: y` turned into `true`.
   merged by digest) pushed to `ghcr.io/sebastka/pingwarden` with SBOM and
   provenance. Pushes to `master` publish `edge`; `v*` tags publish semver tags.
 - **Pinning:** Actions are pinned by commit SHA, with the version in a comment.
-- **Dependabot:** weekly, grouped, for Cargo, Actions, the Dockerfile and the
-  compose example.
+- **Updates:** Renovate; see D27.
 - **Credentials:** pulling DHI images uses the `DOCKERHUB_USERNAME` variable and the `DOCKERHUB_TOKEN` secret.
   Pull requests from forks skip the Docker job.
 
@@ -328,6 +327,34 @@ prefer something else.
   the `health` listener, so the image's `HEALTHCHECK` works with any layout.
 - **No TLS.** Pingwarden serves plain HTTP; TLS termination belongs to the
   proxy or ingress.
+
+### D27. Renovate rather than Dependabot
+Dependabot's parsers read only `FROM` lines in Dockerfiles and `uses:` in
+workflows (checked in dependabot-core). It would therefore miss:
+- the pinned `# syntax=` directive;
+- the PostgreSQL and MariaDB service containers in CI;
+- the yamllint version run through pipx.
+
+Renovate (`.github/renovate.json5`, hosted Mend app) covers all of them:
+- **Schedule:** it runs nightly (00:00-06:00 Europe/Paris), and grouped PRs
+  merge themselves through GitHub auto-merge once the required checks pass.
+  GitHub signs the squash commits, so they satisfy the signed-commit rule.
+- **Majors are reviewed by hand,** and so are Cargo `0.x` minor bumps, which
+  are semver-incompatible in Cargo.
+- **Release age:** releases wait 3 days before being proposed, except
+  security fixes.
+- **Cargo:** requirements in `Cargo.toml` are raised (`rangeStrategy: bump`),
+  and lock file maintenance refreshes transitive dependencies.
+- **Registry access:** `dhi.io` is reached with the `DOCKERHUB_TOKEN` secret
+  set in the Mend developer portal.
+- **Security alerts:** Dependabot alerts stay enabled as Renovate's
+  vulnerability source. Dependabot security-update PRs are disabled to avoid
+  duplicates.
+- **Toolchain:** CI installs Rust with rustup instead of the branch-pinned
+  `dtolnay/rust-toolchain` action, which neither bot can update. The toolchain
+  version (`RUST_TOOLCHAIN`, `rust-version`) deliberately stays manual: it
+  follows the Rust shipped in the DHI build image, so it is bumped when a base
+  image update brings a new Rust.
 
 ## Not done yet
 
