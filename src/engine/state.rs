@@ -8,12 +8,15 @@
 //!   notification (dependency down, flapping) is therefore sent later if the
 //!   condition persists after the suppression ends, and recoveries are only
 //!   announced for outages that were announced.
+//! * An acknowledged outage gets no reminders; the acknowledgement ends when
+//!   the monitor is up again. A silenced monitor notifies nothing until the
+//!   silence ends; the suppression is recorded on its transitions.
 
 use std::collections::VecDeque;
 
 use crate::config::{EventKind, FlapConfig};
 use crate::model::{Outcome, Status};
-use crate::store::PersistedState;
+use crate::store::{Acknowledgement, PersistedState, Silence};
 
 #[derive(Clone, Debug)]
 pub struct Policy {
@@ -34,8 +37,14 @@ pub struct MonitorState {
     pub last_notified_at: Option<i64>,
     pub paused: bool,
     pub flapping: bool,
+    pub ack: Option<Acknowledgement>,
+    pub silence: Option<Silence>,
     flips: VecDeque<i64>,
 }
+
+/// Why a monitor cannot be acknowledged.
+#[derive(Debug, PartialEq, Eq)]
+pub struct NotAcknowledgeable(pub Status);
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Effects {
@@ -67,6 +76,8 @@ impl MonitorState {
             last_notified_at: None,
             paused: false,
             flapping: false,
+            ack: None,
+            silence: None,
             flips: VecDeque::new(),
         }
     }
@@ -81,6 +92,8 @@ impl MonitorState {
             last_notified_at: p.last_notified_at,
             paused: p.paused,
             flapping: false,
+            ack: p.ack.clone(),
+            silence: p.silence.clone(),
             flips: VecDeque::new(),
         }
     }
@@ -92,6 +105,8 @@ impl MonitorState {
             notified_status: self.notified_status,
             last_notified_at: self.last_notified_at,
             paused: self.paused,
+            ack: self.ack.clone(),
+            silence: self.silence.clone(),
         }
     }
 
@@ -101,7 +116,45 @@ impl MonitorState {
             fx.persist = true;
             self.status = to;
             self.since = now;
+            // The acknowledged problem is over.
+            if to == Status::Up {
+                self.ack = None;
+            }
         }
+    }
+
+    /// Acknowledge the current problem (down, pending or degraded).
+    pub fn acknowledge(&mut self, ack: Acknowledgement) -> Result<Effects, NotAcknowledgeable> {
+        if !matches!(self.status, Status::Down | Status::Pending | Status::Degraded) {
+            return Err(NotAcknowledgeable(self.status));
+        }
+        self.ack = Some(ack);
+        Ok(Effects {
+            persist: true,
+            ..Effects::default()
+        })
+    }
+
+    pub fn unacknowledge(&mut self) -> Effects {
+        Effects {
+            persist: self.ack.take().is_some(),
+            ..Effects::default()
+        }
+    }
+
+    /// Set (or with `None`, lift) a silence.
+    pub fn set_silence(&mut self, silence: Option<Silence>) -> Effects {
+        let persist = self.silence != silence;
+        self.silence = silence;
+        Effects {
+            persist,
+            ..Effects::default()
+        }
+    }
+
+    /// The silence in force at `now`, if any.
+    pub fn silenced(&self, now: i64) -> Option<&Silence> {
+        self.silence.as_ref().filter(|s| s.until > now)
     }
 
     pub fn set_paused(&mut self, paused: bool, now: i64) -> Effects {
@@ -121,6 +174,10 @@ impl MonitorState {
         let mut fx = Effects::default();
         if self.paused {
             return fx;
+        }
+        if self.silence.as_ref().is_some_and(|s| s.until <= now) {
+            self.silence = None;
+            fx.persist = true;
         }
         if ctx.maintenance.is_some() {
             self.fails = 0;
@@ -172,7 +229,10 @@ impl MonitorState {
         };
 
         if flap_started {
-            self.notify(EventKind::Flapping, now, &mut fx);
+            match self.silenced(now) {
+                Some(s) => fx.suppressed = Some(silence_reason(s)),
+                None => self.notify(EventKind::Flapping, now, &mut fx),
+            }
             return fx;
         }
 
@@ -193,6 +253,7 @@ impl MonitorState {
                 }
             }
         } else if self.status == Status::Down
+            && self.ack.is_none()
             && policy.renotify_every_ms > 0
             && self
                 .last_notified_at
@@ -205,6 +266,10 @@ impl MonitorState {
 
     /// Send `kind` unless a suppression applies.
     fn decide(&mut self, kind: EventKind, ctx: &Context<'_>, now: i64, fx: &mut Effects) {
+        if let Some(s) = self.silenced(now) {
+            fx.suppressed = Some(silence_reason(s));
+            return;
+        }
         let outage = matches!(kind, EventKind::Down | EventKind::Reminder);
         if outage && let Some(dep) = ctx.dependency_down {
             fx.suppressed = Some(format!("dependency {dep} is down"));
@@ -245,6 +310,13 @@ impl MonitorState {
         }
         false
     }
+}
+
+fn silence_reason(s: &Silence) -> String {
+    let until = jiff::Timestamp::from_second(s.until.div_euclid(1000))
+        .map(|t| t.to_string())
+        .unwrap_or_else(|_| s.until.to_string());
+    format!("silenced by {} until {until}", s.by)
 }
 
 /// An availability flip: into or out of `down`.

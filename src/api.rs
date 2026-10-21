@@ -2,28 +2,35 @@
 //! actions and the push endpoint. See `docs/api.md`.
 
 use std::collections::{BTreeMap, HashMap};
+use std::convert::Infallible;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use axum::Extension;
+use axum::body::Bytes;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::{self, Next};
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::stream::{self, Stream};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{mpsc, oneshot};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::auth::{AuthError, OidcVerifier, Principal, looks_like_jwt};
-use crate::config::{Config, CorsConfig, Endpoints, MonitorConfig, TokenScope};
-use crate::engine::{CommandError, Engine, LiveView, PushReport};
+use crate::config::{Config, CorsConfig, Dur, Endpoints, EventKind, MonitorConfig, TokenScope};
+use crate::engine::{CommandError, Engine, LiveView, PushReport, WindowError};
+use crate::maintenance::{Window, WindowRequest};
 use crate::metrics::Metrics;
 use crate::model::{Outcome, Status, now_ms};
-use crate::store::{Rollup, Store};
+use crate::store::{Acknowledgement, NotificationFilter, Rollup, Silence, Store, WINDOW_KEEP_MS};
 
 pub type ReloadRequest = oneshot::Sender<Result<(), String>>;
 
@@ -101,8 +108,16 @@ fn cors_layer(c: &CorsConfig) -> CorsLayer {
 fn api_routes(state: AppStateRef) -> Router<AppStateRef> {
     Router::new()
         .route("/status", get(status))
+        .route("/me", get(me))
+        .route("/stream", get(stream_changes))
+        .route("/rollups", get(bulk_rollups))
         .route("/monitors", get(list_monitors))
         .route("/monitors/{id}", get(get_monitor))
+        .route("/monitors/{id}/config", get(monitor_config))
+        .route("/monitors/{id}/ack", post(ack))
+        .route("/monitors/{id}/unack", post(unack))
+        .route("/monitors/{id}/silence", post(silence))
+        .route("/monitors/{id}/unsilence", post(unsilence))
         .route("/monitors/{id}/heartbeats", get(heartbeats))
         .route("/monitors/{id}/events", get(monitor_events))
         .route("/monitors/{id}/uptime", get(uptime))
@@ -113,7 +128,8 @@ fn api_routes(state: AppStateRef) -> Router<AppStateRef> {
         .route("/groups", get(groups))
         .route("/tags", get(tags))
         .route("/events", get(events))
-        .route("/maintenance", get(maintenance))
+        .route("/maintenance", get(maintenance).post(create_maintenance))
+        .route("/maintenance/{id}/end", post(end_maintenance))
         .route("/notifiers", get(notifiers))
         .route("/notifiers/{id}/test", post(test_notifier))
         .route("/notifications", get(notifications))
@@ -145,9 +161,33 @@ impl From<CommandError> for ApiError {
             CommandError::UnknownMonitor => StatusCode::NOT_FOUND,
             CommandError::Disabled => StatusCode::CONFLICT,
             CommandError::Busy => StatusCode::TOO_MANY_REQUESTS,
+            CommandError::NotAcknowledgeable(_) => StatusCode::CONFLICT,
         };
         ApiError(code, e.to_string())
     }
+}
+
+impl From<WindowError> for ApiError {
+    fn from(e: WindowError) -> Self {
+        match e {
+            WindowError::Invalid(m) => ApiError(StatusCode::BAD_REQUEST, m),
+            WindowError::Conflict(m) => ApiError(StatusCode::CONFLICT, m),
+            WindowError::Unknown => not_found("maintenance window"),
+            WindowError::Store(e) => e.into(),
+        }
+    }
+}
+
+fn bad_request(message: impl Into<String>) -> ApiError {
+    ApiError(StatusCode::BAD_REQUEST, message.into())
+}
+
+/// A JSON request body; an empty body is the type's default.
+fn json_body<T: DeserializeOwned + Default>(body: &Bytes) -> Result<T, ApiError> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(T::default());
+    }
+    serde_json::from_slice(body).map_err(|e| bad_request(format!("invalid JSON body: {e}")))
 }
 
 fn not_found(what: &str) -> ApiError {
@@ -304,6 +344,8 @@ struct MonitorBody {
     interval_seconds: f64,
     depends_on: Vec<String>,
     notify: Vec<String>,
+    /// Uptime target in percent.
+    slo: Option<f64>,
     #[serde(flatten)]
     live: Option<LiveView>,
 }
@@ -321,7 +363,15 @@ fn monitor_body(m: &MonitorConfig, live: Option<&LiveView>) -> MonitorBody {
         interval_seconds: m.interval.0.as_secs_f64(),
         depends_on: m.depends_on.clone(),
         notify: m.notify.clone(),
-        live: live.cloned(),
+        slo: m.slo,
+        live: live.cloned().map(|mut l| {
+            // A silence that ran out is no silence, even before the next check.
+            if l.silenced_until.is_some_and(|u| u <= now_ms()) {
+                l.silenced_until = None;
+                l.silenced_by = None;
+            }
+            l
+        }),
     }
 }
 
@@ -421,9 +471,38 @@ async fn events(State(state): State<AppStateRef>, Query(r): Query<Range>) -> Api
     Ok(Json(json!({ "from": from, "to": to, "events": rows })))
 }
 
-async fn notifications(State(state): State<AppStateRef>, Query(r): Query<Range>) -> ApiResult<Value> {
+#[derive(Deserialize)]
+struct NotificationQuery {
+    monitor: Option<String>,
+    notifier: Option<String>,
+    success: Option<String>,
+    event: Option<String>,
+}
+
+async fn notifications(
+    State(state): State<AppStateRef>,
+    Query(r): Query<Range>,
+    Query(q): Query<NotificationQuery>,
+) -> ApiResult<Value> {
     let (from, to, limit) = r.resolve(7 * DAY_MS);
-    let rows = state.store.notifications(from, to, limit).await?;
+    let success = match q.success.as_deref() {
+        None => None,
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        Some(other) => return Err(bad_request(format!("invalid success {other:?} (true or false)"))),
+    };
+    if let Some(e) = &q.event
+        && serde_json::from_value::<EventKind>(json!(e)).is_err()
+    {
+        return Err(bad_request(format!("unknown event {e:?}")));
+    }
+    let filter = NotificationFilter {
+        monitor: q.monitor,
+        notifier: q.notifier,
+        success,
+        event: q.event,
+    };
+    let rows = state.store.notifications(&filter, from, to, limit).await?;
     Ok(Json(json!({ "from": from, "to": to, "notifications": rows })))
 }
 
@@ -501,6 +580,187 @@ async fn rollups(
     let from = q.from.unwrap_or(to - span);
     let rows = state.store.rollups(&id, res, from, to).await?;
     Ok(Json(json!({ "monitor": id, "resolution": res, "rollups": rows })))
+}
+
+#[derive(Deserialize)]
+struct BulkRollupQuery {
+    resolution: Option<String>,
+    from: Option<i64>,
+    to: Option<i64>,
+    tag: Option<String>,
+    group: Option<String>,
+}
+
+/// Rollups of every configured monitor in one query.
+async fn bulk_rollups(State(state): State<AppStateRef>, Query(q): Query<BulkRollupQuery>) -> ApiResult<Value> {
+    let (res, span, max) = match q.resolution.as_deref().unwrap_or("hour") {
+        "hour" => (3600, DAY_MS, 31 * DAY_MS),
+        "day" => (86_400, 30 * DAY_MS, 400 * DAY_MS),
+        other => return Err(bad_request(format!("unknown resolution {other:?} (hour or day)"))),
+    };
+    let to = q.to.unwrap_or_else(|| now_ms() + 1);
+    let from = q.from.unwrap_or(to - span);
+    if from >= to {
+        return Err(bad_request("`from` must be before `to`"));
+    }
+    if to - from > max {
+        return Err(bad_request(format!(
+            "the range may span at most {} days at this resolution",
+            max / DAY_MS
+        )));
+    }
+    let config = state.config();
+    let mut rows = state.store.rollups_all(res, from, to).await?;
+    let monitors: serde_json::Map<String, Value> = config
+        .monitors
+        .iter()
+        .filter(|m| q.tag.as_deref().is_none_or(|t| m.has_tag(t)))
+        .filter(|m| q.group.as_deref().is_none_or(|g| m.group_path.iter().any(|p| p == g)))
+        .map(|m| (m.id.clone(), json!(rows.remove(&m.id).unwrap_or_default())))
+        .collect();
+    Ok(Json(
+        json!({ "resolution": res, "from": from, "to": to, "monitors": monitors }),
+    ))
+}
+
+async fn monitor_config(State(state): State<AppStateRef>, Path(id): Path<String>) -> ApiResult<Value> {
+    let m = find_monitor(&state.config(), &id)?;
+    Ok(Json(crate::config::effective(&m)))
+}
+
+async fn me(Extension(who): Extension<Principal>) -> Json<Value> {
+    let (kind, name) = if let Some(n) = who.name.strip_prefix("oidc:") {
+        ("oidc", n)
+    } else if let Some(n) = who.name.strip_prefix("token:") {
+        ("token", n)
+    } else {
+        ("anonymous", who.name.as_str())
+    };
+    let scope = match who.scope {
+        Some(TokenScope::Admin) => "admin",
+        _ => "read",
+    };
+    Json(json!({ "name": name, "kind": kind, "scope": scope }))
+}
+
+/// Server-sent events: one per change, until leadership ends or shutdown.
+async fn stream_changes(
+    State(state): State<AppStateRef>,
+) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
+    let engine = state.engine()?;
+    let (rx, permit, cancel) = engine.subscribe().ok_or_else(|| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("too many live streams (at most {})", crate::stream::MAX_STREAMS),
+        )
+    })?;
+    // The stream holds its receiver and slot, not the engine.
+    drop(engine);
+    let events = stream::unfold((rx, permit, cancel), |(mut rx, permit, cancel)| async move {
+        let event = tokio::select! {
+            _ = cancel.cancelled() => return None,
+            r = rx.recv() => match r {
+                Ok(change) => SseEvent::default().event(change.name()).data(change.data()),
+                Err(RecvError::Lagged(_)) => SseEvent::default().event("resync").data("{}"),
+                Err(RecvError::Closed) => return None,
+            },
+        };
+        Some((Ok(event), (rx, permit, cancel)))
+    });
+    Ok(Sse::new(events).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("keepalive")))
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AckBody {
+    comment: Option<String>,
+}
+
+async fn ack(
+    State(state): State<AppStateRef>,
+    Extension(who): Extension<Principal>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<Value> {
+    let b: AckBody = json_body(&body)?;
+    let comment = b.comment.map(|c| c.trim().to_owned()).filter(|c| !c.is_empty());
+    if comment.as_ref().is_some_and(|c| c.chars().count() > 512) {
+        return Err(bad_request("comment is longer than 512 characters"));
+    }
+    let ack = Acknowledgement {
+        by: who.name.clone(),
+        at: now_ms(),
+        comment,
+    };
+    state.engine()?.acknowledge(&id, Some(ack)).await?;
+    tracing::info!(principal = %who.name, monitor = %id, "monitor acknowledged");
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn unack(
+    State(state): State<AppStateRef>,
+    Extension(who): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<Value> {
+    state.engine()?.acknowledge(&id, None).await?;
+    tracing::info!(principal = %who.name, monitor = %id, "acknowledgement withdrawn");
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SilenceBody {
+    duration: Option<String>,
+    until: Option<i64>,
+}
+
+const MAX_SILENCE_MS: i64 = 7 * DAY_MS;
+
+/// End of a requested silence: `duration` from now, or `until`; at most 7 days.
+fn silence_until(b: &SilenceBody, now: i64) -> Result<i64, String> {
+    let until = match (&b.duration, b.until) {
+        (Some(_), Some(_)) => return Err("set `duration` or `until`, not both".into()),
+        (None, None) => return Err("set `duration` (e.g. \"2h\") or `until`".into()),
+        (Some(d), None) => {
+            let d: Dur = d.parse().map_err(|e| format!("{e}"))?;
+            now.saturating_add(d.as_millis_i64())
+        }
+        (None, Some(u)) => u,
+    };
+    if until <= now {
+        return Err("the silence must end in the future".into());
+    }
+    if until - now > MAX_SILENCE_MS {
+        return Err("a silence may last at most 7 days".into());
+    }
+    Ok(until)
+}
+
+async fn silence(
+    State(state): State<AppStateRef>,
+    Extension(who): Extension<Principal>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<Value> {
+    let b: SilenceBody = json_body(&body)?;
+    let until = silence_until(&b, now_ms()).map_err(bad_request)?;
+    let s = Silence {
+        until,
+        by: who.name.clone(),
+    };
+    state.engine()?.silence(&id, Some(s)).await?;
+    tracing::info!(principal = %who.name, monitor = %id, until, "monitor silenced");
+    Ok(Json(json!({ "ok": true, "silenced_until": until })))
+}
+
+async fn unsilence(
+    State(state): State<AppStateRef>,
+    Extension(who): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<Value> {
+    state.engine()?.silence(&id, None).await?;
+    tracing::info!(principal = %who.name, monitor = %id, "silence lifted");
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn run_now(
@@ -594,20 +854,71 @@ async fn tags(State(state): State<AppStateRef>) -> ApiResult<Value> {
     Ok(Json(json!(out)))
 }
 
+fn window_json(w: &Window, config: &Config, now: i64) -> Value {
+    let until = w.active_until(now);
+    let monitors: Vec<&str> = config
+        .monitors
+        .iter()
+        .filter(|m| w.applies_to(m))
+        .map(|m| m.id.as_str())
+        .collect();
+    let bounds = w.bounds();
+    json!({
+        "id": w.id,
+        "description": w.description,
+        "active": until.is_some(),
+        "active_until": until,
+        "monitors": monitors,
+        "source": if w.created_by.is_some() { "api" } else { "config" },
+        "start": bounds.map(|b| b.0),
+        "end": bounds.map(|b| b.1),
+        "recurring": bounds.is_none(),
+        "created_by": w.created_by,
+    })
+}
+
+/// Configured windows, then runtime ones (those that ended in the last week too).
 async fn maintenance(State(state): State<AppStateRef>) -> ApiResult<Value> {
     let config = state.config();
     let now = now_ms();
+    let engine = state.engine.read().ok().and_then(|e| e.clone());
+    // A standby has no engine: read the runtime windows from the database.
+    let runtime = match engine {
+        Some(e) => e.runtime_windows(),
+        None => state.store.load_windows(now - WINDOW_KEEP_MS).await?,
+    };
     let out: Vec<Value> = config
         .maintenance
         .iter()
-        .filter_map(|w| crate::maintenance::Window::parse(w).ok())
-        .map(|w| {
-            let until = w.active_until(now);
-            let monitors: Vec<&str> = config.monitors.iter().filter(|m| w.applies_to(m)).map(|m| m.id.as_str()).collect();
-            json!({ "id": w.id, "description": w.description, "active": until.is_some(), "active_until": until, "monitors": monitors })
-        })
+        .filter_map(|w| Window::parse(w).ok())
+        .chain(runtime.iter().map(Window::from_runtime))
+        .map(|w| window_json(&w, &config, now))
         .collect();
     Ok(Json(json!(out)))
+}
+
+async fn create_maintenance(
+    State(state): State<AppStateRef>,
+    Extension(who): Extension<Principal>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let req: WindowRequest = json_body(&body)?;
+    let engine = state.engine()?;
+    let w = engine.create_window(req, &who.name).await?;
+    tracing::info!(principal = %who.name, window = %w.id, start = w.start_ms, end = w.end_ms, "maintenance window created");
+    let body = window_json(&Window::from_runtime(&w), &engine.config(), now_ms());
+    Ok((StatusCode::CREATED, Json(body)).into_response())
+}
+
+async fn end_maintenance(
+    State(state): State<AppStateRef>,
+    Extension(who): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<Value> {
+    let engine = state.engine()?;
+    let w = engine.end_window(&id).await?;
+    tracing::info!(principal = %who.name, window = %id, "maintenance window ended");
+    Ok(Json(window_json(&Window::from_runtime(&w), &engine.config(), now_ms())))
 }
 
 // -------------------------------------------------------------- notifiers
@@ -728,6 +1039,53 @@ mod tests {
         assert!(token_eq("abcdefghijklmnop", "abcdefghijklmnop"));
         assert!(!token_eq("abcdefghijklmnop", "abcdefghijklmnoq"));
         assert!(!token_eq("abc", "abcd"));
+    }
+
+    #[test]
+    fn limits_silences() {
+        let now = 1_000_000;
+        let body = |duration: Option<&str>, until: Option<i64>| SilenceBody {
+            duration: duration.map(str::to_owned),
+            until,
+        };
+        assert_eq!(silence_until(&body(Some("2h"), None), now), Ok(now + 7_200_000));
+        assert_eq!(silence_until(&body(None, Some(now + 5)), now), Ok(now + 5));
+        assert_eq!(silence_until(&body(Some("7d"), None), now), Ok(now + 7 * DAY_MS));
+        assert!(
+            silence_until(&body(Some("8d"), None), now)
+                .unwrap_err()
+                .contains("7 days")
+        );
+        assert!(
+            silence_until(&body(Some("0"), None), now)
+                .unwrap_err()
+                .contains("future")
+        );
+        assert!(
+            silence_until(&body(None, Some(now)), now)
+                .unwrap_err()
+                .contains("future")
+        );
+        assert!(
+            silence_until(&body(Some("1h"), Some(now + 5)), now)
+                .unwrap_err()
+                .contains("not both")
+        );
+        assert!(silence_until(&body(None, None), now).is_err());
+        assert!(
+            silence_until(&body(Some("later"), None), now)
+                .unwrap_err()
+                .contains("invalid duration")
+        );
+    }
+
+    #[test]
+    fn parses_optional_json_bodies() {
+        let empty: AckBody = json_body(&Bytes::from_static(b"")).unwrap();
+        assert!(empty.comment.is_none());
+        let c: AckBody = json_body(&Bytes::from_static(br#"{"comment":"on it"}"#)).unwrap();
+        assert_eq!(c.comment.as_deref(), Some("on it"));
+        assert!(json_body::<AckBody>(&Bytes::from_static(br#"{"other":1}"#)).is_err());
     }
 
     #[test]

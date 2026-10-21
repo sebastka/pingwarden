@@ -192,6 +192,7 @@ Fallback values for monitors. Groups can override them for their members.
 | `renotify_every` | `0` | Reminder interval while down; `0` disables reminders. |
 | `notify_degraded` | `true` | Notify up↔degraded changes. |
 | `flapping` | unset | `{window: 1h, max_transitions: 6}` enables flap detection. |
+| `slo` | unset | Uptime target in percent, e.g. `99.9` (between 0 and 100). Shown by UIs (error budgets); Pingwarden computes nothing with it. |
 
 ## `tls`
 
@@ -215,7 +216,7 @@ A mapping of id to notifier. Every notifier has a `type` and an optional
 
 | `type` | Keys |
 |---|---|
-| `webhook` | `url`, `method` (`POST`), `headers`. The body is the JSON event shown below. |
+| `webhook` | `url`, `method` (`POST`), `headers`. The body is the JSON event shown below; `GET` and `HEAD` send no body. |
 | `ntfy` | `url` (topic URL), `token` or `username`/`password`, `priority` (1-5, for down/reminder; default 4). |
 | `gotify` | `url`, `token` (application token), `priority`. |
 | `matrix` | `homeserver`, `room_id`, `access_token`. |
@@ -264,8 +265,8 @@ groups:
 ```
 
 `defaults` takes `interval`, `timeout`, `failure_threshold`,
-`recovery_threshold`, `notify`, `renotify_every`, `notify_degraded`, `flapping`
-and `degraded_latency`.
+`recovery_threshold`, `notify`, `renotify_every`, `notify_degraded`, `flapping`,
+`degraded_latency` and `slo`.
 
 A group's status is computed from its members, including subgroups:
 
@@ -291,6 +292,7 @@ Keys common to every monitor:
 | `interval`, `timeout`, `failure_threshold`, `recovery_threshold`, `notify`, `renotify_every`, `notify_degraded` | Override the group and global defaults. |
 | `flapping` | `{window, max_transitions}`, or `false` to disable an inherited setting. |
 | `degraded_latency` | Report `degraded` when a successful check takes longer than this. |
+| `slo` | Uptime target in percent (overrides the group and global defaults). |
 | `depends_on` | Monitor ids. While one of them is down, this monitor's down notifications are suppressed. |
 
 The type-specific keys are documented in [checks.md](checks.md).
@@ -320,6 +322,10 @@ maintenance:
 During a window, checks still run, results are recorded as `maintenance`, and
 no notifications are sent. Uptime figures exclude maintenance time.
 
+Short one-off windows can also be started (and ended early) at runtime with
+`POST /api/v1/maintenance` (admin, at most 30 days); see the [API](api.md).
+They live in the database, not in the configuration.
+
 ## Alerting behaviour
 
 1. Every check yields `up`, `degraded` or `down`.
@@ -338,5 +344,8 @@ no notifications are sent. Uptime figures exclude maintenance time.
    - A dependency is down. Applies to down notifications and reminders.
    - The monitor is flapping.
    - Maintenance.
+   - A silence set through the API (`POST /api/v1/monitors/{id}/silence`).
 
    A suppressed outage that persists afterwards is notified then.
+6. An outage acknowledged through the API (`POST /api/v1/monitors/{id}/ack`)
+   gets no reminders; the acknowledgement ends when the monitor is up.

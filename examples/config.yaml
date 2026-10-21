@@ -84,6 +84,8 @@ groups:
     tags: [public]
     defaults:
       notify: [ntfy, ops-mail]
+      # Uptime target shown by UIs (error budget); Pingwarden only exposes it.
+      slo: 99.9
 
 monitors:
   - id: router

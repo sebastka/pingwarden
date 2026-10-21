@@ -26,6 +26,8 @@ pub const RESOLUTIONS: [i32; 2] = [3600, 86_400];
 const MESSAGE_MAX: usize = 1024;
 const INSERT_CHUNK: usize = 200;
 const DELETE_CHUNK: i64 = 5000;
+/// How long ended runtime maintenance windows are kept (and listed).
+pub const WINDOW_KEEP_MS: i64 = 7 * 86_400_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dialect {
@@ -55,6 +57,57 @@ pub struct PersistedState {
     pub notified_status: Option<Status>,
     pub last_notified_at: Option<i64>,
     pub paused: bool,
+    pub ack: Option<Acknowledgement>,
+    pub silence: Option<Silence>,
+}
+
+/// An outage acknowledged through the API: no reminders until it is over.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Acknowledgement {
+    /// Principal, e.g. `oidc:alice`.
+    pub by: String,
+    pub at: i64,
+    pub comment: Option<String>,
+}
+
+/// Notifications about a monitor muted through the API until `until`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Silence {
+    pub until: i64,
+    pub by: String,
+}
+
+/// A maintenance window created through the API.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct RuntimeWindow {
+    pub id: String,
+    pub description: Option<String>,
+    pub selection: WindowSelection,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub created_by: String,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct WindowSelection {
+    #[serde(default)]
+    pub all: bool,
+    #[serde(default)]
+    pub monitors: Vec<String>,
+    #[serde(default)]
+    pub groups: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// Filters of the notification log.
+#[derive(Clone, Debug, Default)]
+pub struct NotificationFilter {
+    pub monitor: Option<String>,
+    pub notifier: Option<String>,
+    pub success: Option<bool>,
+    pub event: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -94,7 +147,7 @@ pub struct HeartbeatRow {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct EventRow {
     pub id: i64,
     pub monitor_id: String,
@@ -105,7 +158,7 @@ pub struct EventRow {
     pub suppressed_reason: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct NotificationRow {
     pub id: i64,
     pub ts: i64,
@@ -173,6 +226,7 @@ pub struct CleanupStats {
     pub events: u64,
     pub notifications: u64,
     pub monitors: u64,
+    pub windows: u64,
 }
 
 /// Rewrite `?` placeholders as `$1`, `$2`… (queries contain no `?` literal).
@@ -306,13 +360,26 @@ impl Store {
     }
 
     pub async fn load_states(&self) -> anyhow::Result<HashMap<String, PersistedState>> {
-        let rows = sqlx::query(
-            self.sql("SELECT monitor_id, status, since, notified_status, last_notified_at, paused FROM monitor_state"),
-        )
+        let rows = sqlx::query(self.sql(
+            "SELECT monitor_id, status, since, notified_status, last_notified_at, paused, \
+             ack_by, ack_at, ack_comment, silenced_until, silenced_by FROM monitor_state",
+        ))
         .fetch_all(&self.pool)
         .await?;
         let mut out = HashMap::with_capacity(rows.len());
         for r in rows {
+            let ack = match (r.try_get::<Option<String>, _>(6)?, r.try_get::<Option<i64>, _>(7)?) {
+                (Some(by), Some(at)) => Some(Acknowledgement {
+                    by,
+                    at,
+                    comment: r.try_get(8)?,
+                }),
+                _ => None,
+            };
+            let silence = match (r.try_get::<Option<i64>, _>(9)?, r.try_get::<Option<String>, _>(10)?) {
+                (Some(until), Some(by)) => Some(Silence { until, by }),
+                _ => None,
+            };
             out.insert(
                 r.try_get::<String, _>(0)?,
                 PersistedState {
@@ -321,6 +388,8 @@ impl Store {
                     notified_status: opt_status(r.try_get(3)?),
                     last_notified_at: r.try_get(4)?,
                     paused: r.try_get::<i16, _>(5)? != 0,
+                    ack,
+                    silence,
                 },
             );
         }
@@ -330,16 +399,24 @@ impl Store {
     pub async fn save_state(&self, monitor_id: &str, s: &PersistedState, now: i64) -> anyhow::Result<()> {
         let q = match self.dialect {
             Dialect::Postgres => self.sql(
-                "INSERT INTO monitor_state (monitor_id, status, since, notified_status, last_notified_at, paused, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (monitor_id) DO UPDATE SET \
+                "INSERT INTO monitor_state (monitor_id, status, since, notified_status, last_notified_at, paused, \
+                 ack_by, ack_at, ack_comment, silenced_until, silenced_by, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (monitor_id) DO UPDATE SET \
                  status = EXCLUDED.status, since = EXCLUDED.since, notified_status = EXCLUDED.notified_status, \
-                 last_notified_at = EXCLUDED.last_notified_at, paused = EXCLUDED.paused, updated_at = EXCLUDED.updated_at",
+                 last_notified_at = EXCLUDED.last_notified_at, paused = EXCLUDED.paused, \
+                 ack_by = EXCLUDED.ack_by, ack_at = EXCLUDED.ack_at, ack_comment = EXCLUDED.ack_comment, \
+                 silenced_until = EXCLUDED.silenced_until, silenced_by = EXCLUDED.silenced_by, \
+                 updated_at = EXCLUDED.updated_at",
             ),
             Dialect::MySql => self.sql(
-                "INSERT INTO monitor_state (monitor_id, status, since, notified_status, last_notified_at, paused, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE \
+                "INSERT INTO monitor_state (monitor_id, status, since, notified_status, last_notified_at, paused, \
+                 ack_by, ack_at, ack_comment, silenced_until, silenced_by, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE \
                  status = VALUES(status), since = VALUES(since), notified_status = VALUES(notified_status), \
-                 last_notified_at = VALUES(last_notified_at), paused = VALUES(paused), updated_at = VALUES(updated_at)",
+                 last_notified_at = VALUES(last_notified_at), paused = VALUES(paused), \
+                 ack_by = VALUES(ack_by), ack_at = VALUES(ack_at), ack_comment = VALUES(ack_comment), \
+                 silenced_until = VALUES(silenced_until), silenced_by = VALUES(silenced_by), \
+                 updated_at = VALUES(updated_at)",
             ),
         };
         sqlx::query(q)
@@ -349,6 +426,11 @@ impl Store {
             .bind(s.notified_status.map(Status::code))
             .bind(s.last_notified_at)
             .bind(i16::from(s.paused))
+            .bind(s.ack.as_ref().map(|a| a.by.clone()))
+            .bind(s.ack.as_ref().map(|a| a.at))
+            .bind(s.ack.as_ref().and_then(|a| a.comment.clone()))
+            .bind(s.silence.as_ref().map(|x| x.until))
+            .bind(s.silence.as_ref().map(|x| x.by.clone()))
             .bind(now)
             .execute(&self.pool)
             .await?;
@@ -450,34 +532,83 @@ impl Store {
         Ok(())
     }
 
-    pub async fn insert_event(&self, e: &EventRecord) -> anyhow::Result<()> {
-        sqlx::query(self.sql(
-            "INSERT INTO events (monitor_id, ts, from_status, to_status, message, suppressed_reason) VALUES (?, ?, ?, ?, ?, ?)",
-        ))
-        .bind(&e.monitor_id)
-        .bind(e.ts)
-        .bind(e.from.map(Status::code))
-        .bind(e.to.code())
-        .bind(truncate(&e.message))
-        .bind(e.suppressed_reason.clone())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+    /// Insert an event and return it as the API lists it (with its id).
+    pub async fn insert_event(&self, e: &EventRecord) -> anyhow::Result<EventRow> {
+        let message = truncate(&e.message);
+        let q = match self.dialect {
+            Dialect::Postgres => self.sql(
+                "INSERT INTO events (monitor_id, ts, from_status, to_status, message, suppressed_reason) \
+                 VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+            ),
+            Dialect::MySql => self.sql(
+                "INSERT INTO events (monitor_id, ts, from_status, to_status, message, suppressed_reason) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            ),
+        };
+        let q = sqlx::query(q)
+            .bind(&e.monitor_id)
+            .bind(e.ts)
+            .bind(e.from.map(Status::code))
+            .bind(e.to.code())
+            .bind(message.clone())
+            .bind(e.suppressed_reason.clone());
+        let id = self.insert_returning_id(q).await?;
+        Ok(EventRow {
+            id,
+            monitor_id: e.monitor_id.clone(),
+            ts: e.ts,
+            from: e.from,
+            to: e.to,
+            message: Some(message),
+            suppressed_reason: e.suppressed_reason.clone(),
+        })
     }
 
-    pub async fn insert_notification(&self, n: &NotificationRecord) -> anyhow::Result<()> {
-        sqlx::query(self.sql(
-            "INSERT INTO notifications (ts, monitor_id, notifier, event, success, error) VALUES (?, ?, ?, ?, ?, ?)",
-        ))
-        .bind(n.ts)
-        .bind(n.monitor_id.clone())
-        .bind(&n.notifier)
-        .bind(&n.event)
-        .bind(i16::from(n.success))
-        .bind(n.error.as_deref().map(truncate))
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+    /// Insert a delivery record and return it as the API lists it (with its id).
+    pub async fn insert_notification(&self, n: &NotificationRecord) -> anyhow::Result<NotificationRow> {
+        let error = n.error.as_deref().map(truncate);
+        let q = match self.dialect {
+            Dialect::Postgres => self.sql(
+                "INSERT INTO notifications (ts, monitor_id, notifier, event, success, error) \
+                 VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+            ),
+            Dialect::MySql => self.sql(
+                "INSERT INTO notifications (ts, monitor_id, notifier, event, success, error) VALUES (?, ?, ?, ?, ?, ?)",
+            ),
+        };
+        let q = sqlx::query(q)
+            .bind(n.ts)
+            .bind(n.monitor_id.clone())
+            .bind(&n.notifier)
+            .bind(&n.event)
+            .bind(i16::from(n.success))
+            .bind(error.clone());
+        let id = self.insert_returning_id(q).await?;
+        Ok(NotificationRow {
+            id,
+            ts: n.ts,
+            monitor_id: n.monitor_id.clone(),
+            notifier: n.notifier.clone(),
+            event: n.event.clone(),
+            success: n.success,
+            error,
+        })
+    }
+
+    /// Run an INSERT and return the generated id: `RETURNING id` on
+    /// PostgreSQL, the last insert id on MariaDB.
+    async fn insert_returning_id(
+        &self,
+        q: sqlx::query::Query<'_, sqlx::Any, sqlx::any::AnyArguments>,
+    ) -> anyhow::Result<i64> {
+        match self.dialect {
+            Dialect::Postgres => Ok(q.fetch_one(&self.pool).await?.try_get::<i64, _>(0)?),
+            Dialect::MySql => q
+                .execute(&self.pool)
+                .await?
+                .last_insert_id()
+                .context("the database returned no insert id"),
+        }
     }
 
     // -------------------------------------------------------------- reads
@@ -537,16 +668,41 @@ impl Store {
         rows.iter().map(event_row).collect()
     }
 
-    pub async fn notifications(&self, from: i64, to: i64, limit: i64) -> anyhow::Result<Vec<NotificationRow>> {
-        let rows = sqlx::query(self.sql(
-            "SELECT id, ts, monitor_id, notifier, event, success, error FROM notifications \
-             WHERE ts >= ? AND ts < ? ORDER BY ts DESC, id DESC LIMIT ?",
-        ))
-        .bind(from)
-        .bind(to)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+    pub async fn notifications(
+        &self,
+        filter: &NotificationFilter,
+        from: i64,
+        to: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<NotificationRow>> {
+        let mut sql = String::from(
+            "SELECT id, ts, monitor_id, notifier, event, success, error FROM notifications WHERE ts >= ? AND ts < ?",
+        );
+        for (cond, set) in [
+            (" AND monitor_id = ?", filter.monitor.is_some()),
+            (" AND notifier = ?", filter.notifier.is_some()),
+            (" AND success = ?", filter.success.is_some()),
+            (" AND event = ?", filter.event.is_some()),
+        ] {
+            if set {
+                sql.push_str(cond);
+            }
+        }
+        sql.push_str(" ORDER BY ts DESC, id DESC LIMIT ?");
+        let mut q = sqlx::query(self.sql_owned(sql)).bind(from).bind(to);
+        if let Some(m) = &filter.monitor {
+            q = q.bind(m.clone());
+        }
+        if let Some(n) = &filter.notifier {
+            q = q.bind(n.clone());
+        }
+        if let Some(ok) = filter.success {
+            q = q.bind(i16::from(ok));
+        }
+        if let Some(e) = &filter.event {
+            q = q.bind(e.clone());
+        }
+        let rows = q.bind(limit).fetch_all(&self.pool).await?;
         rows.iter()
             .map(|r| {
                 Ok(NotificationRow {
@@ -591,6 +747,103 @@ impl Store {
             .collect()
     }
 
+    /// Rollups of every monitor at one resolution, in one query, by monitor.
+    pub async fn rollups_all(
+        &self,
+        resolution: i32,
+        from: i64,
+        to: i64,
+    ) -> anyhow::Result<HashMap<String, Vec<Rollup>>> {
+        let rows = sqlx::query(self.sql(
+            "SELECT monitor_id, bucket, up_count, degraded_count, down_count, maintenance_count, latency_sum_us, \
+             latency_count, latency_min_us, latency_max_us FROM rollups \
+             WHERE resolution = ? AND bucket >= ? AND bucket < ? ORDER BY monitor_id, bucket",
+        ))
+        .bind(resolution)
+        .bind(from)
+        .bind(to)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out: HashMap<String, Vec<Rollup>> = HashMap::new();
+        for r in rows {
+            out.entry(r.try_get(0)?).or_default().push(Rollup {
+                bucket: r.try_get(1)?,
+                up: r.try_get(2)?,
+                degraded: r.try_get(3)?,
+                down: r.try_get(4)?,
+                maintenance: r.try_get(5)?,
+                latency_sum_us: r.try_get(6)?,
+                latency_count: r.try_get(7)?,
+                latency_min_us: r.try_get(8)?,
+                latency_max_us: r.try_get(9)?,
+            });
+        }
+        Ok(out)
+    }
+
+    // ---------------------------------------------- runtime maintenance
+
+    pub async fn insert_window(&self, w: &RuntimeWindow) -> anyhow::Result<()> {
+        sqlx::query(self.sql(
+            "INSERT INTO maintenance_windows (id, description, selection, start_ms, end_ms, created_by, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ))
+        .bind(&w.id)
+        .bind(w.description.clone())
+        .bind(serde_json::to_string(&w.selection)?)
+        .bind(w.start_ms)
+        .bind(w.end_ms)
+        .bind(&w.created_by)
+        .bind(w.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Runtime windows ending at or after `ended_after`, by start.
+    pub async fn load_windows(&self, ended_after: i64) -> anyhow::Result<Vec<RuntimeWindow>> {
+        let rows = sqlx::query(self.sql(
+            "SELECT id, description, selection, start_ms, end_ms, created_by, created_at FROM maintenance_windows \
+             WHERE end_ms >= ? ORDER BY start_ms, id",
+        ))
+        .bind(ended_after)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(RuntimeWindow {
+                    id: r.try_get(0)?,
+                    description: r.try_get(1)?,
+                    selection: serde_json::from_str(&r.try_get::<String, _>(2)?).context("invalid window selection")?,
+                    start_ms: r.try_get(3)?,
+                    end_ms: r.try_get(4)?,
+                    created_by: r.try_get(5)?,
+                    created_at: r.try_get(6)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Whether a runtime window with this id exists (ended ones included, until purged).
+    pub async fn window_exists(&self, id: &str) -> anyhow::Result<bool> {
+        let row = sqlx::query(self.sql("SELECT COUNT(*) FROM maintenance_windows WHERE id = ?"))
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.try_get::<i64, _>(0)? > 0)
+    }
+
+    /// End a window: its end becomes `end_ms` unless it already ended earlier.
+    pub async fn end_window(&self, id: &str, end_ms: i64) -> anyhow::Result<()> {
+        sqlx::query(self.sql("UPDATE maintenance_windows SET end_ms = ? WHERE id = ? AND end_ms > ?"))
+            .bind(end_ms)
+            .bind(id)
+            .bind(end_ms)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     // ------------------------------------------------------------ cleanup
 
     pub async fn cleanup(&self, r: &RetentionConfig, now: i64) -> anyhow::Result<CleanupStats> {
@@ -615,6 +868,12 @@ impl Store {
                     .rows_affected();
             }
         }
+        // Ended runtime maintenance windows are listed for a week, then purged.
+        stats.windows = sqlx::query(self.sql("DELETE FROM maintenance_windows WHERE end_ms < ?"))
+            .bind(now - WINDOW_KEEP_MS)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
         if let Some(c) = cutoff(r.removed_monitors) {
             let gone: Vec<String> =
                 sqlx::query(self.sql("SELECT id FROM monitors WHERE removed_at IS NOT NULL AND removed_at < ?"))

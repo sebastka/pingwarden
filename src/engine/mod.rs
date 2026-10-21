@@ -6,7 +6,7 @@ mod monitor;
 pub mod state;
 pub mod writer;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -21,11 +21,12 @@ use writer::Writer;
 
 use crate::checks::{Check, CheckContext};
 use crate::config::{CheckConfig, Config, GroupConfig, GroupStatusPolicy, MonitorConfig};
-use crate::maintenance::Window;
+use crate::maintenance::{Window, WindowRequest};
 use crate::metrics::Metrics;
 use crate::model::{Status, now_ms};
 use crate::notify::Dispatcher;
-use crate::store::{MonitorMeta, Store};
+use crate::store::{Acknowledgement, MonitorMeta, RuntimeWindow, Silence, Store, WINDOW_KEEP_MS};
+use crate::stream::{Change, Hub};
 
 /// Live view of a monitor, served by the API.
 #[derive(Clone, Debug, Serialize)]
@@ -40,8 +41,14 @@ pub struct LiveView {
     pub paused: bool,
     pub flapping: bool,
     pub maintenance: Option<String>,
+    /// Seconds since the epoch (deprecated: see `cert_expires_at`).
     pub cert_expiry: Option<i64>,
+    /// The same instant in milliseconds.
+    pub cert_expires_at: Option<i64>,
     pub consecutive_failures: u32,
+    pub acknowledged: Option<Acknowledgement>,
+    pub silenced_until: Option<i64>,
+    pub silenced_by: Option<String>,
 }
 
 impl Default for LiveView {
@@ -57,7 +64,11 @@ impl Default for LiveView {
             flapping: false,
             maintenance: None,
             cert_expiry: None,
+            cert_expires_at: None,
             consecutive_failures: 0,
+            acknowledged: None,
+            silenced_until: None,
+            silenced_by: None,
         }
     }
 }
@@ -69,6 +80,7 @@ pub struct Shared {
     pub dispatcher: Dispatcher,
     pub metrics: Metrics,
     pub live: RwLock<HashMap<String, LiveView>>,
+    pub hub: Hub,
     maintenance: RwLock<Arc<Vec<Window>>>,
     semaphore: Semaphore,
 }
@@ -90,6 +102,8 @@ pub struct Engine {
     config: RwLock<Arc<Config>>,
     monitors: Mutex<HashMap<String, MonitorHandle>>,
     push_tokens: RwLock<HashMap<String, String>>,
+    /// Maintenance windows created through the API (ended ones for a week).
+    runtime_windows: RwLock<Vec<RuntimeWindow>>,
     cancel: CancellationToken,
     writer_cancel: CancellationToken,
     background: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -103,6 +117,20 @@ pub enum CommandError {
     Disabled,
     #[error("monitor is busy")]
     Busy,
+    #[error("only a down, pending or degraded monitor can be acknowledged; this one is {}", .0.as_str())]
+    NotAcknowledgeable(Status),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum WindowError {
+    #[error("{0}")]
+    Invalid(String),
+    #[error("{0}")]
+    Conflict(String),
+    #[error("unknown maintenance window")]
+    Unknown,
+    #[error(transparent)]
+    Store(#[from] anyhow::Error),
 }
 
 fn meta(m: &MonitorConfig) -> MonitorMeta {
@@ -115,12 +143,14 @@ fn meta(m: &MonitorConfig) -> MonitorMeta {
     }
 }
 
-fn windows(config: &Config) -> Vec<Window> {
+/// Configured windows followed by runtime ones.
+fn windows(config: &Config, runtime: &[RuntimeWindow]) -> Vec<Window> {
     // Validated at load time; a failure here cannot happen.
     config
         .maintenance
         .iter()
         .filter_map(|w| Window::parse(w).ok())
+        .chain(runtime.iter().map(Window::from_runtime))
         .collect()
 }
 
@@ -147,10 +177,12 @@ impl Engine {
         let metas: Vec<_> = config.monitors.iter().map(meta).collect();
         store.sync_monitors(&metas, now_ms()).await?;
         let persisted = store.load_states().await?;
+        let runtime_windows = store.load_windows(now_ms() - WINDOW_KEEP_MS).await?;
 
         let cancel = CancellationToken::new();
         let writer_cancel = CancellationToken::new();
-        let (writer, writer_task) = Writer::spawn(store.clone(), metrics.clone(), writer_cancel.clone());
+        let hub = Hub::new();
+        let (writer, writer_task) = Writer::spawn(store.clone(), metrics.clone(), hub.clone(), writer_cancel.clone());
         let dispatcher = Dispatcher::spawn(
             config.notifiers.clone(),
             writer.clone(),
@@ -164,7 +196,8 @@ impl Engine {
             dispatcher,
             metrics: metrics.clone(),
             live: RwLock::new(HashMap::new()),
-            maintenance: RwLock::new(Arc::new(windows(&config))),
+            hub,
+            maintenance: RwLock::new(Arc::new(windows(&config, &runtime_windows))),
             semaphore: Semaphore::new(config.runtime.max_concurrent_checks),
         });
 
@@ -185,6 +218,7 @@ impl Engine {
             shared,
             store,
             push_tokens: RwLock::new(push_tokens(&config)),
+            runtime_windows: RwLock::new(runtime_windows),
             config: RwLock::new(config),
             monitors: Mutex::new(handles),
             cancel,
@@ -192,7 +226,7 @@ impl Engine {
             background: Mutex::new(vec![writer_task]),
         });
         let cleanup = tokio::spawn(engine.clone().cleanup_loop());
-        let groups = tokio::spawn(engine.clone().group_metrics_loop());
+        let groups = tokio::spawn(engine.clone().periodic_loop());
         engine.background.lock().await.extend([cleanup, groups]);
         Ok(engine)
     }
@@ -246,6 +280,81 @@ impl Engine {
         &self.shared.dispatcher
     }
 
+    /// A receiver of live changes, the stream slot it holds, and a token
+    /// cancelled when this engine stops; `None` when every slot is taken.
+    pub fn subscribe(
+        &self,
+    ) -> Option<(
+        tokio::sync::broadcast::Receiver<Arc<Change>>,
+        tokio::sync::OwnedSemaphorePermit,
+        CancellationToken,
+    )> {
+        let (rx, permit) = self.shared.hub.subscribe()?;
+        Some((rx, permit, self.cancel.clone()))
+    }
+
+    fn refresh_windows(&self, config: &Config) {
+        let runtime = self.runtime_windows();
+        if let Ok(mut m) = self.shared.maintenance.write() {
+            *m = Arc::new(windows(config, &runtime));
+        }
+    }
+
+    /// Runtime maintenance windows, ended ones included for a week.
+    pub fn runtime_windows(&self) -> Vec<RuntimeWindow> {
+        self.runtime_windows.read().map(|w| w.clone()).unwrap_or_default()
+    }
+
+    /// Create a maintenance window through the API.
+    pub async fn create_window(&self, req: WindowRequest, by: &str) -> Result<RuntimeWindow, WindowError> {
+        let config = self.config();
+        let w = crate::maintenance::runtime_window(req, by, now_ms(), &config).map_err(WindowError::Invalid)?;
+        if config.maintenance.iter().any(|c| c.id == w.id)
+            || self.runtime_windows().iter().any(|r| r.id == w.id)
+            || self.store.window_exists(&w.id).await?
+        {
+            return Err(WindowError::Conflict(format!(
+                "a maintenance window `{}` already exists",
+                w.id
+            )));
+        }
+        self.store.insert_window(&w).await?;
+        if let Ok(mut r) = self.runtime_windows.write() {
+            r.push(w.clone());
+        }
+        self.refresh_windows(&config);
+        self.shared.hub.publish(Change::Maintenance);
+        Ok(w)
+    }
+
+    /// End a runtime maintenance window now.
+    pub async fn end_window(&self, id: &str) -> Result<RuntimeWindow, WindowError> {
+        let config = self.config();
+        if config.maintenance.iter().any(|c| c.id == id) {
+            return Err(WindowError::Conflict(
+                "configured windows cannot be ended through the API; change the configuration".into(),
+            ));
+        }
+        let Some(mut w) = self.runtime_windows().into_iter().find(|w| w.id == id) else {
+            return Err(WindowError::Unknown);
+        };
+        let now = now_ms();
+        if w.end_ms > now {
+            self.store.end_window(id, now).await?;
+            // A window that has not started yet ends before it starts.
+            w.start_ms = w.start_ms.min(now);
+            w.end_ms = now;
+            if let Ok(mut all) = self.runtime_windows.write()
+                && let Some(slot) = all.iter_mut().find(|x| x.id == id)
+            {
+                *slot = w.clone();
+            }
+            self.refresh_windows(&config);
+            self.shared.hub.publish(Change::Maintenance);
+        }
+        Ok(w)
+    }
+
     /// Reconcile running monitors with a new configuration.
     pub async fn apply(&self, new: Arc<Config>) -> anyhow::Result<()> {
         let old = self.config();
@@ -266,9 +375,7 @@ impl Engine {
         self.store.sync_monitors(&metas, now_ms()).await?;
 
         self.shared.dispatcher.replace_notifiers(new.notifiers.clone());
-        if let Ok(mut m) = self.shared.maintenance.write() {
-            *m = Arc::new(windows(&new));
-        }
+        self.refresh_windows(&new);
 
         let mut handles = self.monitors.lock().await;
         let (mut added, mut changed, mut removed) = (0, 0, 0);
@@ -334,6 +441,7 @@ impl Engine {
             *c = new;
         }
         tracing::info!(added, changed, removed, "configuration reloaded");
+        self.shared.hub.publish(Change::Reload);
         Ok(())
     }
 
@@ -364,7 +472,29 @@ impl Engine {
     pub async fn set_paused(&self, id: &str, paused: bool) -> Result<(), CommandError> {
         let (tx, rx) = oneshot::channel();
         self.send(id, Command::Pause(paused, tx)).await?;
-        rx.await.map_err(|_| CommandError::Busy)
+        rx.await.map_err(|_| CommandError::Busy)?;
+        self.shared.hub.publish(Change::Monitor(id.to_owned()));
+        Ok(())
+    }
+
+    /// Acknowledge the monitor's current problem, or with `None` withdraw it.
+    pub async fn acknowledge(&self, id: &str, ack: Option<Acknowledgement>) -> Result<(), CommandError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(id, Command::Ack(ack, tx)).await?;
+        rx.await
+            .map_err(|_| CommandError::Busy)?
+            .map_err(CommandError::NotAcknowledgeable)?;
+        self.shared.hub.publish(Change::Monitor(id.to_owned()));
+        Ok(())
+    }
+
+    /// Silence the monitor's notifications, or with `None` lift the silence.
+    pub async fn silence(&self, id: &str, silence: Option<Silence>) -> Result<(), CommandError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(id, Command::Silence(silence, tx)).await?;
+        rx.await.map_err(|_| CommandError::Busy)?;
+        self.shared.hub.publish(Change::Monitor(id.to_owned()));
+        Ok(())
     }
 
     /// Deliver a push result; returns the monitor id.
@@ -410,12 +540,43 @@ impl Engine {
         }
     }
 
-    async fn group_metrics_loop(self: Arc<Self>) {
+    /// Every 5 s: group metrics, and a `maintenance` change when the set of
+    /// active windows changed (a window started or ended by itself).
+    async fn periodic_loop(self: Arc<Self>) {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
+        let mut active: Option<BTreeSet<String>> = None;
         loop {
             tokio::select! {
                 _ = self.cancel.cancelled() => return,
-                _ = tick.tick() => self.shared.metrics.set_groups(&self.group_statuses()),
+                _ = tick.tick() => {}
+            }
+            self.shared.metrics.set_groups(&self.group_statuses());
+            let now = now_ms();
+            let current: BTreeSet<String> = self
+                .shared
+                .maintenance
+                .read()
+                .map(|w| {
+                    w.iter()
+                        .filter(|w| w.active_until(now).is_some())
+                        .map(|w| w.id.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if active.as_ref().is_some_and(|a| *a != current) {
+                self.shared.hub.publish(Change::Maintenance);
+            }
+            active = Some(current);
+            // Forget runtime windows that ended over a week ago.
+            let stale = self
+                .runtime_windows
+                .read()
+                .is_ok_and(|r| r.iter().any(|w| w.end_ms < now - WINDOW_KEEP_MS));
+            if stale {
+                if let Ok(mut r) = self.runtime_windows.write() {
+                    r.retain(|w| w.end_ms >= now - WINDOW_KEEP_MS);
+                }
+                self.refresh_windows(&self.config());
             }
         }
     }

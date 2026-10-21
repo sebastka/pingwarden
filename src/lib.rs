@@ -12,3 +12,4 @@ pub mod metrics;
 pub mod model;
 pub mod notify;
 pub mod store;
+pub mod stream;

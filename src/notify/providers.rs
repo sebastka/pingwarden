@@ -6,19 +6,11 @@ use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use serde_json::json;
 
 use super::Notification;
-use crate::config::{EmailNotifier, EventKind, NotifierKind, SmtpSecurity};
+use crate::config::{EmailNotifier, EventKind, NotifierKind, SmtpSecurity, WebhookNotifier};
 
 pub async fn send(http: &reqwest::Client, kind: &NotifierKind, n: &Notification) -> Result<(), String> {
     match kind {
-        NotifierKind::Webhook(w) => {
-            let method = reqwest::Method::from_bytes(w.method.to_ascii_uppercase().as_bytes())
-                .map_err(|_| "invalid method".to_owned())?;
-            let mut req = http.request(method, &w.url).json(n);
-            for (k, v) in &w.headers {
-                req = req.header(k, v);
-            }
-            check(req.send().await).await
-        }
+        NotifierKind::Webhook(w) => check(webhook_request(http, w, n)?.send().await).await,
         NotifierKind::Ntfy(c) => {
             let priority = match (n.event, c.priority) {
                 (EventKind::Down | EventKind::Reminder, Some(p)) => p.to_string(),
@@ -124,6 +116,26 @@ pub async fn send(http: &reqwest::Client, kind: &NotifierKind, n: &Notification)
         }
         NotifierKind::Email(c) => email(c, n).await,
     }
+}
+
+/// The webhook request: the JSON event as body, except for GET and HEAD,
+/// which carry none (servers may reject or stall on a GET with a body).
+fn webhook_request(
+    http: &reqwest::Client,
+    w: &WebhookNotifier,
+    n: &Notification,
+) -> Result<reqwest::RequestBuilder, String> {
+    let method = reqwest::Method::from_bytes(w.method.to_ascii_uppercase().as_bytes())
+        .map_err(|_| "invalid method".to_owned())?;
+    let bodyless = method == reqwest::Method::GET || method == reqwest::Method::HEAD;
+    let mut req = http.request(method, &w.url);
+    if !bodyless {
+        req = req.json(n);
+    }
+    for (k, v) in &w.headers {
+        req = req.header(k, v);
+    }
+    Ok(req)
 }
 
 async fn check(res: Result<reqwest::Response, reqwest::Error>) -> Result<(), String> {

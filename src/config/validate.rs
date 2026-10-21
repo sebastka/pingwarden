@@ -180,6 +180,7 @@ pub fn validate(c: &Config) -> Result<(), ConfigError> {
         }
     };
     check_notify("defaults.notify", &c.defaults.notify, &mut err);
+    check_slo("defaults.slo", c.defaults.slo, &mut err);
 
     // groups
     let mut groups: HashMap<&str, &super::GroupConfig> = HashMap::new();
@@ -197,6 +198,7 @@ pub fn validate(c: &Config) -> Result<(), ConfigError> {
         if let Some(n) = &g.defaults.notify {
             check_notify(&format!("groups.{}.defaults.notify", g.id), n, &mut err);
         }
+        check_slo(&format!("groups.{}.defaults.slo", g.id), g.defaults.slo, &mut err);
     }
     for g in &c.groups {
         if let Some(p) = &g.parent {
@@ -255,6 +257,7 @@ pub fn validate(c: &Config) -> Result<(), ConfigError> {
             ));
         }
         check_notify(&p, &m.notify, &mut err);
+        check_slo(&format!("{p}.slo"), m.slo, &mut err);
         if let CheckConfig::Push(push) = &m.check {
             if push.token.len() < MIN_SECRET_LEN {
                 err(format!("{p}: push token must be at least {MIN_SECRET_LEN} characters"));
@@ -342,6 +345,17 @@ pub fn valid_id(id: &str) -> bool {
     chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
         && id.len() <= 128
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// An uptime target is a percentage strictly between 0 and 100.
+fn check_slo(owner: &str, slo: Option<f64>, err: &mut dyn FnMut(String)) {
+    if let Some(v) = slo
+        && !(v > 0.0 && v < 100.0)
+    {
+        err(format!(
+            "{owner}: must be a percentage between 0 and 100 (exclusive), e.g. 99.9"
+        ));
+    }
 }
 
 fn check_tags(owner: &str, tags: &[String], err: &mut dyn FnMut(String)) {

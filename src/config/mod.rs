@@ -2,6 +2,7 @@
 //! substitution, merged and validated into a [`Config`].
 
 mod duration;
+mod effective;
 mod interpolate;
 mod schema;
 mod validate;
@@ -14,7 +15,9 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
 pub use duration::Dur;
+pub use effective::effective;
 pub use schema::*;
+pub use validate::valid_id;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {

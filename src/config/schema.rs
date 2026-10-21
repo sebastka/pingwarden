@@ -269,6 +269,8 @@ pub struct DefaultsConfig {
     pub renotify_every: Dur,
     pub notify_degraded: bool,
     pub flapping: Option<FlapConfig>,
+    /// Uptime target in percent, exposed to UIs; Pingwarden computes nothing with it.
+    pub slo: Option<f64>,
 }
 
 impl Default for DefaultsConfig {
@@ -282,6 +284,7 @@ impl Default for DefaultsConfig {
             renotify_every: Dur::ZERO,
             notify_degraded: true,
             flapping: None,
+            slo: None,
         }
     }
 }
@@ -501,6 +504,7 @@ pub(super) const COMMON_MONITOR_KEYS: &[&str] = &[
     "flapping",
     "depends_on",
     "degraded_latency",
+    "slo",
     "group",
 ];
 
@@ -526,6 +530,7 @@ pub(super) struct CommonMonitorFields {
     #[serde(default)]
     depends_on: Vec<String>,
     degraded_latency: Option<Dur>,
+    slo: Option<f64>,
     group: Option<String>,
 }
 
@@ -553,6 +558,8 @@ pub struct MonitorConfig {
     pub flapping: Option<FlapConfig>,
     pub depends_on: Vec<String>,
     pub degraded_latency: Option<Dur>,
+    /// Uptime target in percent (exposed only).
+    pub slo: Option<f64>,
     pub group: Option<String>,
     /// The group and its ancestors, nearest first.
     pub group_path: Vec<String>,
@@ -606,6 +613,7 @@ impl MonitorConfig {
             renotify_every: inherit!(renotify_every).unwrap_or(d.renotify_every),
             notify_degraded: inherit!(notify_degraded).unwrap_or(d.notify_degraded),
             degraded_latency: inherit!(degraded_latency),
+            slo: inherit!(slo).or(d.slo),
             flapping,
             id: c.id,
             description: c.description,
@@ -671,6 +679,7 @@ pub struct GroupDefaults {
     pub notify_degraded: Option<bool>,
     pub flapping: Option<FlapSetting>,
     pub degraded_latency: Option<Dur>,
+    pub slo: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
