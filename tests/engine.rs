@@ -53,11 +53,15 @@ async fn next_event(rx: &mut mpsc::UnboundedReceiver<Value>) -> Value {
         .expect("channel closed")
 }
 
-fn config(url: &str, hook: &str, target: &str, token: &str, with_tcp: bool) -> String {
+/// `svc` and `job` are unique per run: monitor state persists in the
+/// database, so fixed ids would make a rerun on the same database start
+/// from the previous run's outage.
+fn config(url: &str, hook: &str, target: &str, token: &str, ids: (&str, &str), with_tcp: bool) -> String {
+    let (svc, job) = ids;
     let tcp = if with_tcp {
         format!(
             r#"
-  - id: svc
+  - id: {svc}
     type: tcp
     host: "{}"
     port: {}
@@ -87,7 +91,7 @@ groups:
   - id: core
     tags: [prod]
 monitors:{tcp}
-  - id: job
+  - id: {job}
     type: push
     token: "{token}"
     interval: 1h
@@ -111,14 +115,16 @@ async fn monitors_notify_and_reload() {
         });
 
         let token = common::unique("token").replace('-', "_");
-        let cfg = pingwarden::config::from_str(&config(&url, &hook, &addr, &token, true)).unwrap();
+        let (svc, job) = (common::unique("svc"), common::unique("job"));
+        let ids = (svc.as_str(), job.as_str());
+        let cfg = pingwarden::config::from_str(&config(&url, &hook, &addr, &token, ids, true)).unwrap();
         let svc_tags = cfg.monitors[0].effective_tags.clone();
         assert_eq!(svc_tags, vec!["prod"]);
         let engine = Engine::start(Arc::new(cfg), store.clone(), Metrics::new())
             .await
             .unwrap();
 
-        wait_for(&engine, "svc", Status::Up).await;
+        wait_for(&engine, &svc, Status::Up).await;
         assert_eq!(engine.group_statuses(), vec![("core".to_owned(), Status::Up)]);
 
         // Close the port: two failures make the service down and notify.
@@ -126,7 +132,7 @@ async fn monitors_notify_and_reload() {
         let _ = accept.await;
         let down = next_event(&mut events).await;
         assert_eq!(down["event"], "down", "{down}");
-        assert_eq!(down["monitor_id"], "svc");
+        assert_eq!(down["monitor_id"], svc.as_str());
         assert_eq!(down["group"], "core");
         assert_eq!(down["tags"][0], "prod");
         assert_eq!(engine.group_statuses(), vec![("core".to_owned(), Status::Down)]);
@@ -143,7 +149,7 @@ async fn monitors_notify_and_reload() {
             )
             .await
             .unwrap();
-        wait_for(&engine, "job", Status::Pending).await;
+        wait_for(&engine, &job, Status::Pending).await;
         assert!(
             engine
                 .push(
@@ -159,24 +165,24 @@ async fn monitors_notify_and_reload() {
         );
 
         // Pause and resume.
-        engine.set_paused("svc", true).await.unwrap();
-        wait_for(&engine, "svc", Status::Paused).await;
-        engine.set_paused("svc", false).await.unwrap();
+        engine.set_paused(&svc, true).await.unwrap();
+        wait_for(&engine, &svc, Status::Paused).await;
+        engine.set_paused(&svc, false).await.unwrap();
 
         // Reload without the TCP monitor.
-        let cfg = pingwarden::config::from_str(&config(&url, &hook, &addr, &token, false)).unwrap();
+        let cfg = pingwarden::config::from_str(&config(&url, &hook, &addr, &token, ids, false)).unwrap();
         engine.apply(Arc::new(cfg)).await.unwrap();
-        assert!(!engine.live().contains_key("svc"));
-        assert!(engine.live().contains_key("job"));
+        assert!(!engine.live().contains_key(&svc));
+        assert!(engine.live().contains_key(&job));
 
         engine.shutdown().await;
-        let beats = store.heartbeats("svc", 0, i64::MAX, 1000).await.unwrap();
+        let beats = store.heartbeats(&svc, 0, i64::MAX, 1000).await.unwrap();
         assert!(beats.iter().any(|b| b.status == Status::Up), "{name}");
         assert!(beats.iter().any(|b| b.status == Status::Down), "{name}");
-        let events = store.events(Some("svc"), 0, i64::MAX, 100).await.unwrap();
+        let events = store.events(Some(&svc), 0, i64::MAX, 100).await.unwrap();
         assert!(events.iter().any(|e| e.to == Status::Down), "{name}");
         let states = store.load_states().await.unwrap();
-        assert_eq!(states["job"].status, Status::Pending, "{name}");
+        assert_eq!(states[&job].status, Status::Pending, "{name}");
     }
 }
 
@@ -288,10 +294,13 @@ monitors:
                 let _ = target.accept().await;
             }
         });
-        let up = next_change(
-            &mut changes,
-            |c| matches!(c, Change::Transition(e) if e.to == Status::Up),
-        )
+        // Transitions reach the stream after the writer's batched insert, up
+        // to a second late: the initial `unknown -> up` may still be queued
+        // here. Wait for this recovery precisely.
+        let up = next_change(&mut changes, |c| {
+            matches!(c, Change::Transition(e)
+                if e.monitor_id == svc && e.from == Some(Status::Down) && e.to == Status::Up)
+        })
         .await;
         let Change::Transition(e) = &*up else { unreachable!() };
         assert!(e.id > 0);
