@@ -176,8 +176,12 @@ async fn api_accepts_static_and_oidc_tokens() {
             .unwrap()
             .contains("authorization")
     );
+    // The answer depends on the Origin, so caches must key on it: otherwise a
+    // cached response for one origin could be served to another.
+    assert!(varies_on_origin(&ok), "preflight lacks Vary: Origin");
     let denied = preflight("https://evil.example.com").send().await.unwrap();
     assert!(denied.headers().get("access-control-allow-origin").is_none());
+    assert!(varies_on_origin(&denied), "refused preflight lacks Vary: Origin");
     let simple = get(Some(&reader))
         .header("Origin", "https://ui.example.com")
         .send()
@@ -187,6 +191,17 @@ async fn api_accepts_static_and_oidc_tokens() {
         simple.headers()["access-control-allow-origin"],
         "https://ui.example.com"
     );
+    assert!(varies_on_origin(&simple), "response lacks Vary: Origin");
     let body: Value = simple.json().await.unwrap();
     assert_eq!(body["leader"], false);
+}
+
+/// Whether a `Vary` header of the response names `Origin`.
+fn varies_on_origin(resp: &reqwest::Response) -> bool {
+    resp.headers()
+        .get_all("vary")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|name| name.trim().eq_ignore_ascii_case("origin"))
 }
