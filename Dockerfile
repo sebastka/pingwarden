@@ -2,7 +2,7 @@
 
 # Docker Hardened Images, pinned by multi-arch index digest (amd64 + arm64).
 # Renovate keeps the digests (and the syntax directive) up to date.
-FROM dhi.io/rust:1-alpine3.24-dev@sha256:6bbcb7ee79ca392423153a27f9d738ade51052b2282420dbae22babbd27774ab AS build
+FROM dhi.io/rust:1-alpine3.24-dev@sha256:77de5f93fcfa37ede037c590c57f6460c976158aea65bc133dd1739d6235e3ed AS build
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
@@ -19,7 +19,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
  && cp "target/$target/release/pingwarden" /pingwarden
 
 # Minimal hardened runtime: CA certificates and a non-root user, ~3 MB.
-FROM dhi.io/alpine-base:3.24@sha256:a741d4f1ccaf31f9394a36477e50df4620a8030dbff3d9a2ea8e84672b683ada
+FROM dhi.io/alpine-base:3.24@sha256:7b06d747fcb428a0699679955e903b13322c92c79d94ce94c108634f13a714f1
 
 LABEL org.opencontainers.image.title="Pingwarden" \
       org.opencontainers.image.description="Headless, configuration-as-code uptime monitor" \
