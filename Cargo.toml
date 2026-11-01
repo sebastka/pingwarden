@@ -46,7 +46,7 @@ thiserror = "2.0.21"
 tokio = { version = "1.54.0", features = ["rt", "rt-multi-thread", "macros", "net", "time", "signal", "sync", "io-util", "fs"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
 tokio-util = { version = "0.7.20", features = ["rt"] }
-tower-http = { version = "0.6.11", default-features = false, features = ["cors"] }
+tower-http = { version = "0.7.1", default-features = false, features = ["cors"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt", "ansi", "env-filter", "json"] }
 url = "2.5.8"
