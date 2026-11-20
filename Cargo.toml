@@ -25,11 +25,11 @@ base64 = "0.23.1"
 clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
 futures-util = { version = "0.3.34", default-features = false }
 hickory-resolver = { version = "0.26.3", default-features = false, features = ["system-config", "tokio"] }
-jiff = { version = "0.2.45", default-features = false, features = ["std", "tz-system", "tzdb-bundle-always", "tzdb-zoneinfo"] }
+jiff = { version = "0.2.46", default-features = false, features = ["std", "tz-system", "tzdb-bundle-always", "tzdb-zoneinfo"] }
 lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "ring", "rustls-native-certs", "hostname"] }
 mimalloc = { version = "0.1.52", optional = true, default-features = false }
 prometheus-client = "0.25.2"
-rand = { version = "0.10.3", default-features = false, features = ["std", "thread_rng"] }
+rand = { version = "0.10.4", default-features = false, features = ["std", "thread_rng"] }
 regex = { version = "1.13.1", default-features = false, features = ["std", "perf", "unicode"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "form", "http2", "charset"] }
 ring = "0.17.14"
