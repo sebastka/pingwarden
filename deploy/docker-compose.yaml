@@ -30,7 +30,7 @@ services:
     pids_limit: 64
 
   postgres:
-    image: postgres:18-alpine
+    image: postgres:19-alpine
     restart: unless-stopped
     environment:
       POSTGRES_USER: pingwarden
